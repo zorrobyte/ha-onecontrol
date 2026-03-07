@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 import logging
+import os
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -707,7 +708,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "trying direct HCI adapter fallback",
             max_attempts, self.address,
         )
-        for adapter in ("hci0", "hci1", "hci2", "hci3"):
+        try:
+            hci_adapters = sorted(
+                name
+                for name in os.listdir("/sys/class/bluetooth")
+                if name.startswith("hci")
+            )
+        except OSError:
+            hci_adapters = ["hci0"]
+        if not hci_adapters:
+            hci_adapters = ["hci0"]
+        for adapter in hci_adapters:
             _LOGGER.info(
                 "Direct BLE connect to %s via %s", self.address, adapter,
             )
