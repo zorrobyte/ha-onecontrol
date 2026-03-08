@@ -432,7 +432,9 @@ def parse_rgb_light(data: bytes) -> RgbLight | None:
     r = data[4] if len(data) > 4 else 0
     g = data[5] if len(data) > 5 else 0
     b = data[6] if len(data) > 6 else 0
-    bright = data[7] if len(data) > 7 else 255
+    # No brightness byte in this frame — derive from max of R/G/B channels.
+    # data[7] is AutoOff (minutes), not brightness.
+    bright = max(r, g, b)
     return RgbLight(
         table_id=data[1],
         device_id=data[2],

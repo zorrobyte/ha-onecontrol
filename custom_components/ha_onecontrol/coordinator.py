@@ -524,7 +524,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         red: int = 255,
         green: int = 255,
         blue: int = 255,
-        auto_off: int = 0,
+        auto_off: int = 0xFF,
         blink_on_interval: int = 0,
         blink_off_interval: int = 0,
         transition_interval: int = 1000,

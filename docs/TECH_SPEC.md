@@ -83,6 +83,45 @@ HA's default adapter selection (`async_ble_device_from_address`) picks the "best
 
 The `BluetoothScannerDevice` attributes used are `.ble_device` (`BLEDevice`) and `.scanner.source` (str — hciX MAC address for local adapters, proxy hostname for ESPHome proxies).
 
+**Fix (v1.0.19) — Boot connection via local HCI preferred:** The v1.0.16 fix stored the scanner source that produced the first successful auth. On HAOS, the local hci0 adapter is reported by HA's scanner pool with the same MAC that BlueZ advertises (e.g. `E0:D3:62:EA:52:52`), not a hostname. However, at cold boot `CONF_BONDED_SOURCE` may still hold a proxy source from a prior session, causing an immediate ATT INSUF_AUTH (error 19) before the fallback re-learns.
+
+The v1.0.19 fix adds:
+- `async_get_local_adapter_macs()`: queries the BlueZ D-Bus `org.bluez.Adapter1` objects to enumerate all local HCI adapter MAC addresses.
+- `async_is_locally_bonded(address)`: checks `org.bluez.Device1.Paired` to confirm a BlueZ bond exists for the gateway.
+
+On connect, if a local HCI adapter is available in the scanner pool *and* BlueZ confirms a bond, that adapter is strongly preferred over any ESPHome proxy for that candidate set, regardless of RSSI. A single first-attempt error 19 at cold boot (BlueZ SMP not yet ready) is accepted as unavoidable gateway timing behavior.
+
+### 5.5 RGB light protocol
+
+RGB light status is delivered in `0x09` frames with the following layout (confirmed from Android `DeviceStatusParser.kt` / `RgbLightStatus`):
+
+```
+[EventType (1)][DeviceTableId (1)][DeviceId (1)][StatusBytes (8)]...
+```
+
+Each device occupies 9 bytes: `DeviceId (1) + StatusBytes (8)`. The 8 `StatusBytes` map as:
+
+| Offset | Field        | Notes |
+|--------|--------------|-------|
+| 0      | Mode         | 0=Off, 1=Solid, 2=Blink, 4=Jump3, 5=Jump7, 6=Fade3, 7=Fade7, 8=Rainbow, 127=Restore |
+| 1      | Red          | 0–255 |
+| 2      | Green        | 0–255 |
+| 3      | Blue         | 0–255 |
+| 4      | AutoOff      | minutes (0xFF = disabled) |
+| 5      | IntervalHi   | effect interval, big-endian high byte |
+| 6      | IntervalLo   | effect interval, big-endian low byte |
+| 7      | Reserved     | |
+
+`isOn = mode > 0`. There is no brightness byte; HA-facing brightness is derived as `max(R, G, B)`.
+
+ActionRgb (command `0x44`) SOLID wire format:
+```
+[CmdId_lo][CmdId_hi][0x44][TableId][DeviceId][mode][R][G][B][autoOff]
+```
+`autoOff=0xFF` (disabled) is the correct default; `autoOff=0` means auto-off after 0 minutes and causes the device to extinguish the light immediately after the command is received.
+
+Brightness control in HA is implemented by scaling R/G/B channel values proportionally: `ch_scaled = min(255, round(ch * brightness / max(R, G, B)))`.
+
 ## 6. State and Entity Model
 
 - Switch entities map relay actions and status.
@@ -157,6 +196,8 @@ Recent trajectory includes:
 - HVAC command parity improvements
 - relay bounce suppression
 - migration to `ha_onecontrol` domain naming
+- **v1.0.19 — Local HCI adapter preference at boot:** Added `async_get_local_adapter_macs()` (BlueZ D-Bus `org.bluez.Adapter1` enumeration) and `async_is_locally_bonded()` (BlueZ `Device1.Paired` check). At connect time the coordinator now strongly prefers a bonded local HCI adapter over any ESPHome proxy, eliminating the ATT INSUF_AUTH error that occurred at cold boot when `CONF_BONDED_SOURCE` held a stale proxy source. See §5.4 for design detail.
+- **v1.0.20 — RGB light fixes (issue #1):** Three bugs corrected: (1) `auto_off` command field defaulted to `0` (immediate auto-off) instead of `0xFF` (disabled) — lights turned on but the device extinguished them immediately; (2) the `0x09` status frame `AutoOff` byte (offset 4 of StatusBytes) was misread as brightness, causing HA to always report 0% brightness; (3) the `ATTR_BRIGHTNESS` kwarg was ignored on turn-on. Brightness is now derived as `max(R,G,B)` from the status frame and encoded by proportional R/G/B channel scaling on commands. See §5.5 for RGB protocol detail.
 
 ## 12. Known Constraints
 

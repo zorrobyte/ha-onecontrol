@@ -322,6 +322,16 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
         else:
             r, g, b = 255, 255, 255
 
+        # Scale R/G/B to requested brightness.
+        # In ColorMode.RGB, brightness is encoded in the channel values directly.
+        brightness = kwargs.get(ATTR_BRIGHTNESS)
+        if brightness is not None:
+            current_max = max(r, g, b) or 255
+            factor = brightness / current_max
+            r = min(255, round(r * factor))
+            g = min(255, round(g * factor))
+            b = min(255, round(b * factor))
+
         # Resolve effect / mode
         effect = kwargs.get(ATTR_EFFECT)
         if effect and effect in _EFFECT_NAME_TO_MODE:
@@ -335,7 +345,7 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
         if light:
             self.coordinator.rgb_lights[self._key] = RgbLight(
                 table_id=light.table_id, device_id=light.device_id,
-                mode=mode, red=r, green=g, blue=b, brightness=light.brightness,
+                mode=mode, red=r, green=g, blue=b, brightness=max(r, g, b),
             )
             self.async_write_ha_state()
 
