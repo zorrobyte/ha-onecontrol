@@ -101,14 +101,14 @@ from .protocol.tea import calculate_step1_key, calculate_step2_key
 _LOGGER = logging.getLogger(__name__)
 
 _MAX_PENDING_GET_DEVICES_CMDIDS = 128
-# After this many consecutive GetDevices rejections for a table, bypass the
-# get-devices gate and attempt GetDevicesMetadata directly.  This prevents a
-# permanently-blocking state when the gateway refuses the 0x01 wake command
-# (observed after 12V power cycles with a fresh BLE bond).
-_GET_DEVICES_REJECTION_BYPASS_COUNT = 10
 _STARTUP_BOOTSTRAP_WAIT_SECONDS = 8.0
+# Initial backoff between bootstrap retry attempts (doubles each attempt).
 _STARTUP_BOOTSTRAP_BACKOFF_SECONDS = 1.0
-_STARTUP_BOOTSTRAP_MAX_ATTEMPTS = 6
+# Maximum backoff between bootstrap retry attempts.
+_STARTUP_BOOTSTRAP_MAX_BACKOFF_SECONDS = 30.0
+# Total wall-clock seconds to keep retrying bootstrap before giving up.
+# Covers gateways that need minutes to fully boot after a power cycle.
+_STARTUP_BOOTSTRAP_TIMEOUT_SECONDS = 600.0
 
 
 def _device_key(table_id: int, device_id: int) -> str:
@@ -176,6 +176,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_loaded_tables: set[int] = set()
         self._metadata_rejected_tables: set[int] = set()
         self._metadata_retry_counts: dict[int, int] = {}   # table_id → 0x0f retry count
+        self._metadata_retry_pending: set[int] = set()      # table_ids with a retry task in flight
         self._pending_metadata_cmdids: dict[int, int] = {}  # cmdId → table_id
         self._pending_metadata_entries: dict[int, dict[str, DeviceMetadata]] = {}
         self._pending_get_devices_cmdids: dict[int, int] = {}  # cmdId → table_id
@@ -478,31 +479,50 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
 
     async def _bootstrap_table_queries(self, table_id: int) -> None:
-        """Serialize startup GetDevices/metadata queries before heartbeat."""
+        """Serialize startup GetDevices/metadata queries before heartbeat.
+
+        Retries indefinitely with exponential backoff (capped at
+        _STARTUP_BOOTSTRAP_MAX_BACKOFF_SECONDS) until metadata loads
+        successfully, the connection drops, or
+        _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS elapses.  This covers gateways
+        that need many minutes to fully boot after a power cycle — during
+        that window the command processor returns 0x0f on every request.
+        """
+        deadline = time.monotonic() + _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS
+        backoff = _STARTUP_BOOTSTRAP_BACKOFF_SECONDS
+        attempt = 0
         try:
             if table_id in self._metadata_loaded_tables:
                 self._start_heartbeat()
                 return
 
-            for attempt in range(1, _STARTUP_BOOTSTRAP_MAX_ATTEMPTS + 1):
+            while True:
                 if not self._connected or not self._authenticated:
                     return
                 if self.gateway_info is None or self.gateway_info.table_id != table_id:
                     return
                 if table_id in self._metadata_loaded_tables:
                     break
+                if time.monotonic() > deadline:
+                    _LOGGER.warning(
+                        "Bootstrap for table %d timed out after %.0fs — starting heartbeat",
+                        table_id,
+                        _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS,
+                    )
+                    break
+
+                attempt += 1
 
                 if table_id not in self._get_devices_loaded_tables:
                     result = await self._send_query_and_wait("get_devices", table_id)
                     if result != "completed":
                         _LOGGER.debug(
-                            "Startup GetDevices for table %d attempt %d/%d ended with %s",
-                            table_id,
-                            attempt,
-                            _STARTUP_BOOTSTRAP_MAX_ATTEMPTS,
-                            result,
+                            "Startup GetDevices for table %d attempt %d ended with %s"
+                            " (backoff=%.1fs)",
+                            table_id, attempt, result, backoff,
                         )
-                        await asyncio.sleep(_STARTUP_BOOTSTRAP_BACKOFF_SECONDS)
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, _STARTUP_BOOTSTRAP_MAX_BACKOFF_SECONDS)
                         continue
 
                 if table_id in self._metadata_loaded_tables:
@@ -513,14 +533,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     break
 
                 _LOGGER.debug(
-                    "Startup metadata for table %d attempt %d/%d ended with %s",
-                    table_id,
-                    attempt,
-                    _STARTUP_BOOTSTRAP_MAX_ATTEMPTS,
-                    result,
+                    "Startup metadata for table %d attempt %d ended with %s"
+                    " (backoff=%.1fs)",
+                    table_id, attempt, result, backoff,
                 )
                 self._metadata_requested_tables.discard(table_id)
-                await asyncio.sleep(_STARTUP_BOOTSTRAP_BACKOFF_SECONDS)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _STARTUP_BOOTSTRAP_MAX_BACKOFF_SECONDS)
 
             if self._connected and self._authenticated:
                 self._start_heartbeat()
@@ -741,6 +760,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_loaded_tables.clear()
         self._metadata_rejected_tables.clear()
         self._metadata_retry_counts.clear()
+        self._metadata_retry_pending.clear()
         self._pending_metadata_cmdids.clear()
         self._pending_metadata_entries.clear()
         self._pending_get_devices_cmdids.clear()
@@ -1371,30 +1391,33 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _retry_metadata_after_rejection(self, table_id: int) -> None:
         """Retry GetDevicesMetadata 10s after a rejection.
 
-        Mirrors official app behavior of continued retry attempts as long as the
-        tracker is active; do not permanently give up after a fixed retry count.
+        At most one retry task is queued per table at any time; callers must
+        check _metadata_retry_pending before scheduling.
         """
-        await asyncio.sleep(10.0)
-        if not self._connected:
-            return
-        if self._is_startup_bootstrap_active(table_id):
-            _LOGGER.debug(
-                "Retry for metadata table %d suppressed — startup bootstrap active",
-                table_id,
-            )
-            return
-        if table_id in self._metadata_loaded_tables:
-            return
-        _LOGGER.debug("Retrying metadata for table_id=%d after 0x0f rejection", table_id)
-        self._metadata_requested_tables.discard(table_id)
-        if table_id not in self._get_devices_loaded_tables:
-            self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
-            _LOGGER.debug(
-                "Retry for metadata table %d deferred — waiting for GetDevices completion",
-                table_id,
-            )
-            return
-        await self._send_metadata_request(table_id)
+        try:
+            await asyncio.sleep(10.0)
+            if not self._connected:
+                return
+            if self._is_startup_bootstrap_active(table_id):
+                _LOGGER.debug(
+                    "Retry for metadata table %d suppressed — startup bootstrap active",
+                    table_id,
+                )
+                return
+            if table_id in self._metadata_loaded_tables:
+                return
+            _LOGGER.debug("Retrying metadata for table_id=%d after 0x0f rejection", table_id)
+            self._metadata_requested_tables.discard(table_id)
+            if table_id not in self._get_devices_loaded_tables:
+                self._cmd_correlation_stats["metadata_waiting_get_devices"] += 1
+                _LOGGER.debug(
+                    "Retry for metadata table %d deferred — waiting for GetDevices completion",
+                    table_id,
+                )
+                return
+            await self._send_metadata_request(table_id)
+        finally:
+            self._metadata_retry_pending.discard(table_id)
 
     async def _send_initial_get_devices(self) -> None:
         """Send GetDevices at T+500ms to wake the gateway before metadata is requested.
@@ -1675,17 +1698,24 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if error_code == 0x0F:
                         retry_count = self._metadata_retry_counts.get(rejected_table, 0) + 1
                         self._metadata_retry_counts[rejected_table] = retry_count
-                        self._cmd_correlation_stats["metadata_retry_scheduled"] += 1
                         self._resolve_bootstrap_waiter("metadata", rejected_table, rejection_result)
-                        _LOGGER.warning(
-                            "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
-                            " — scheduling retry #%d in 10s",
-                            rejected_table,
-                            retry_count,
-                        )
-                        self.hass.async_create_task(
-                            self._retry_metadata_after_rejection(rejected_table)
-                        )
+                        if rejected_table not in self._metadata_retry_pending:
+                            self._metadata_retry_pending.add(rejected_table)
+                            self._cmd_correlation_stats["metadata_retry_scheduled"] += 1
+                            _LOGGER.warning(
+                                "Metadata rejected by gateway for table_id=%d (errorCode=0x0f)"
+                                " — scheduling retry #%d in 10s",
+                                rejected_table,
+                                retry_count,
+                            )
+                            self.hass.async_create_task(
+                                self._retry_metadata_after_rejection(rejected_table)
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "Metadata retry already pending for table_id=%d — skipping duplicate",
+                                rejected_table,
+                            )
                     else:
                         self._resolve_bootstrap_waiter("metadata", rejected_table, rejection_result)
                         _LOGGER.warning(
@@ -1706,29 +1736,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         reject_count = self._get_devices_reject_counts.get(gd_table, 0) + 1
                         self._get_devices_reject_counts[gd_table] = reject_count
                         self._resolve_bootstrap_waiter("get_devices", gd_table, rejection_result)
-                        if reject_count >= _GET_DEVICES_REJECTION_BYPASS_COUNT:
-                            _LOGGER.warning(
-                                "GetDevices rejected %d times for table_id=%d "
-                                "(cmdId=%d errorCode=0x%02x) — bypassing gate, attempting metadata directly",
-                                reject_count, gd_table, cmd_id,
-                                error_code if error_code >= 0 else 0,
-                            )
-                            self._get_devices_loaded_tables.add(gd_table)
-                            if (
-                                gd_table not in self._metadata_loaded_tables
-                                and gd_table not in self._metadata_requested_tables
-                                and not self._is_startup_bootstrap_active(gd_table)
-                            ):
-                                self.hass.async_create_task(
-                                    self._send_metadata_request(gd_table)
-                                )
-                        else:
-                            _LOGGER.warning(
-                                "GetDevices rejected by gateway for table_id=%d "
-                                "(cmdId=%d errorCode=0x%02x) — metadata requests will wait",
-                                gd_table, cmd_id,
-                                error_code if error_code >= 0 else 0,
-                            )
+                        _LOGGER.warning(
+                            "GetDevices rejected by gateway for table_id=%d "
+                            "(cmdId=%d errorCode=0x%02x, reject #%d) — bootstrap will retry",
+                            gd_table, cmd_id,
+                            error_code if error_code >= 0 else 0,
+                            reject_count,
+                        )
                     else:
                         self._cmd_correlation_stats["command_error_unknown"] += 1
                         count = self._unknown_command_counts.get(cmd_id, 0) + 1
@@ -2011,6 +2025,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_loaded_tables.clear()
         self._metadata_rejected_tables.clear()
         self._metadata_retry_counts.clear()
+        self._metadata_retry_pending.clear()
         self._pending_metadata_cmdids.clear()
         self._pending_metadata_entries.clear()
         self._pending_get_devices_cmdids.clear()
