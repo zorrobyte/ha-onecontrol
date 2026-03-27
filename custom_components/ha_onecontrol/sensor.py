@@ -289,7 +289,7 @@ class OneControlTankSensor(_OneControlSensorBase):
         self._table_id = table_id
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_tank_{table_id:02x}{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_tank_{device_id:02x}"
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -337,7 +337,7 @@ class OneControlGeneratorSensor(_OneControlSensorBase):
         self._table_id = table_id
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_generator_{table_id:02x}{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_generator_{device_id:02x}"
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -384,7 +384,7 @@ class OneControlGeneratorBatterySensor(_OneControlSensorBase):
         self._table_id = table_id
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_gen_battery_{table_id:02x}{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_gen_battery_{device_id:02x}"
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -435,7 +435,7 @@ class OneControlGeneratorTemperatureSensor(_OneControlSensorBase):
         self._table_id = table_id
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_gen_temp_{table_id:02x}{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_gen_temp_{device_id:02x}"
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -482,7 +482,7 @@ class OneControlHourMeterSensor(_OneControlSensorBase):
         self._table_id = table_id
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_hourmeter_{table_id:02x}{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_hourmeter_{device_id:02x}"
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property
@@ -543,7 +543,7 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
         self._table_id = table_id
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_cover_{table_id:02x}{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_cover_{device_id:02x}"
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property

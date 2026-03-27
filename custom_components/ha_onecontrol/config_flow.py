@@ -31,7 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for OneControl."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         """Initialise flow state."""

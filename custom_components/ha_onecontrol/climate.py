@@ -117,7 +117,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_climate_{table_id:02x}{device_id:02x}"
+        self._attr_unique_id = f"{mac}_climate_{device_id:02x}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
