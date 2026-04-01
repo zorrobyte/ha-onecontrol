@@ -103,6 +103,12 @@ This approach is experimental. If you are attempting this, use the `pairing\_te
 
 - **DTC Fault Codes** — 1,934 diagnostic trouble codes with HA event firing for gas appliance faults
 
+## Screenshots
+Gateway Device
+<img width="2036" height="642" alt="image" src="https://github.com/user-attachments/assets/7df9fafc-f233-48e0-897c-bfcb450eebf3" />
+Example Entities
+<img width="1344" height="2106" alt="image" src="https://github.com/user-attachments/assets/156051c5-c65b-4912-ba77-1e6ec49b15dc" />
+
 ## License
 
 MIT
