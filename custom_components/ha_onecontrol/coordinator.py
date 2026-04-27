@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+import hashlib
 import logging
 import os
 import time
@@ -43,8 +44,11 @@ from .ble_agent import (
 from .const import (
     AUTH_SERVICE_UUID,
     BLE_MTU_SIZE,
+    CAN_READ_CHAR_UUID,
+    CAN_VERSION_CHAR_UUID,
     CAN_WRITE_CHAR_UUID,
     CONF_BLUETOOTH_PIN,
+    PASSWORD_UNLOCK_CHAR_UUID,
     CONF_BONDED_SOURCE,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
@@ -75,6 +79,15 @@ from .const import (
 )
 from .protocol.cobs import CobsByteDecoder, cobs_encode
 from .protocol.commands import CommandBuilder
+from .protocol.ids_can_wire import (
+    compose_ids_can_extended_wire_frame,
+    compose_ids_can_standard_wire_frame,
+    decode_ids_can_payload,
+    format_ids_can_payload,
+    ids_can_message_type_name,
+    ids_can_response_name,
+    parse_ids_can_wire_frame,
+)
 from .protocol.events import (
     CoverStatus,
     DeviceLock,
@@ -96,7 +109,13 @@ from .protocol.events import (
 )
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.function_names import get_friendly_name
-from .protocol.tea import calculate_step1_key, calculate_step2_key
+from .protocol.tea import (
+    RC_CYPHER,
+    calculate_can_ble_key_seed_key,
+    calculate_step1_key,
+    calculate_step2_key,
+    tea_encrypt,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -162,6 +181,104 @@ class PendingHvacCommand:
     retry_count: int = 0
 
 
+def _decode_v2_ble_can_frames(raw: bytes) -> list[bytes]:
+    """Decode a V2 BLE CAN notification into one or more IDS-CAN wire frames.
+
+    V2 BLE notification types (byte 0):
+      1 (Packed)       → 4 synthetic 11-bit IDS-CAN frames per device CAN advertisement
+      2 (ElevenBit)    → 1 reconstructed 11-bit IDS-CAN frame
+      3 (TwentyNineBit) → 1 reconstructed 29-bit IDS-CAN frame
+
+    Returns an empty list when the notification is not in V2 format.
+
+    Parity: decompiled BleCommunicationsAdapter.OnDataReceived (IDS.Portable.CAN).
+    """
+    if not raw or raw[0] not in (0x01, 0x02, 0x03):
+        return []
+
+    v2_type = raw[0]
+
+    if v2_type == 0x01:  # Packed
+        if len(raw) < 19:
+            return []
+        device_addr = raw[1]
+        network_status = raw[2]
+        ids_can_version = raw[3]
+        mac = bytes(raw[4:10])
+        product_id = bytes(raw[10:12])
+        product_instance = raw[12]
+        device_type = raw[13]
+        function_name = bytes(raw[14:16])
+        instance_byte = raw[16]
+        device_caps = raw[17]
+        status_len = raw[18]
+        status_data = bytes(raw[19:19 + status_len])
+        return [
+            # NETWORK (11-bit type=0): [DLC=8][0][addr][status][version][mac6]
+            bytes([8, 0x00, device_addr, network_status, ids_can_version]) + mac,
+            # DEVICE_ID (11-bit type=2): [DLC=8][2][addr][prodId2][prodInst][devType][funcName2][inst][caps]
+            bytes([8, 0x02, device_addr]) + product_id
+            + bytes([product_instance, device_type]) + function_name
+            + bytes([instance_byte, device_caps]),
+            # DEVICE_STATUS (11-bit type=3): [DLC=statusLen][3][addr][statusData]
+            bytes([status_len, 0x03, device_addr]) + status_data,
+            # FakeCircuitID (11-bit type=1): [DLC=4][1][addr][0,0,0,0]
+            bytes([4, 0x01, device_addr, 0, 0, 0, 0]),
+        ]
+
+    if v2_type == 0x02:  # ElevenBit
+        if len(raw) < 6:
+            return []
+        msg_type_byte = raw[3]
+        device_addr = raw[4]
+        dlc = raw[5]
+        data = bytes(raw[6:6 + dlc])
+        return [bytes([dlc, msg_type_byte, device_addr]) + data]
+
+    # v2_type == 0x03: TwentyNineBit
+    if len(raw) < 6:
+        return []
+    dlc = raw[5]
+    id4 = bytes(raw[1:5])
+    data = bytes(raw[6:6 + dlc])
+    return [bytes([dlc]) + id4 + data]
+
+
+def _official_can_ble_gateway_version_from_part(data: bytes) -> str:
+    """Decode official CAN-BLE gateway version from software part char bytes.
+
+    Parity: ``GatewayVersionExtensions.GetGatewayVersionFromCharacteristic``.
+    The characteristic is eight bytes; bytes 0..4 contain BCD-like decimal
+    nibbles for part number and byte 6 is the revision character.
+
+    The observed Unity/X1 CAN-BLE bridge reports software part ``24955-G``
+    (descriptor: Bluetooth Gateway Daughter Board XT Assembly).  This part is
+    absent from the decompiled app's older characteristic lookup table, but it
+    behaves like the app's V1 gateway selection while still requiring explicit
+    REMOTE_CONTROL seed/key before relay COMMAND frames are accepted.
+    """
+    if len(data) != 8:
+        return "Unknown"
+    part_number = (
+        (data[0] & 0x0F) * 10000
+        + (data[1] & 0x0F) * 1000
+        + (data[2] & 0x0F) * 100
+        + (data[3] & 0x0F) * 10
+        + (data[4] & 0x0F)
+    )
+    rev = chr(data[6])
+    result = "Unknown"
+    for known_part, min_rev, version in (
+        (20707, "F", "V1"),
+        (24955, "A", "V1"),
+        (23357, "A", "V2"),
+        (23357, "D", "V2_D"),
+    ):
+        if part_number == known_part and rev >= min_rev:
+            result = version
+    return result
+
+
 class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinate BLE communication with a OneControl gateway."""
 
@@ -177,7 +294,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.address: str = entry.data[CONF_ADDRESS]
         self.gateway_pin: str = entry.data.get(CONF_GATEWAY_PIN, DEFAULT_GATEWAY_PIN)
 
-        # ── PIN-based pairing (legacy gateways) ──────────────────────
+        # ── PIN-based pairing (MyRVLink PIN gateways) ─────────────────
         self._pairing_method: str = entry.data.get(CONF_PAIRING_METHOD, "push_button")
         self._instance_tag: str = f"{id(self):x}"[-6:]
         # Android uses gateway_pin for both BLE bonding AND protocol auth.
@@ -244,6 +361,39 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._consecutive_failures: int = 0
         self._last_lockout_clear: float = 0.0
         self._has_can_write: bool = False
+        self._is_can_ble: bool = False  # CAN-only gateway — no MyRvLink AUTH/DATA services
+        # Survives disconnect/reconnect — marks this entry as an IDS-CAN BLE gateway.
+        self._can_ble_confirmed: bool = False
+        # Set to True only after _authenticate_can_ble completes (post-CAN_READ subscribe).
+        # Cleared on every disconnect so the live path in async_can_switch is suppressed
+        # during the PIN-auth window on reconnect (prevents session open with no CAN_READ).
+        self._can_read_subscribed: bool = False
+        self._can_device_types: dict[int, int] = {}  # source_address → IDS-CAN device_type
+        # Commands queued while CAN BLE gateway is between connections.
+        # Tuple: (frame_bytes, enqueue_monotonic, device_id)
+        # device_id is needed so flush can open the REMOTE_CONTROL session first.
+        self._can_commands_queue: list[tuple[bytes, float, int]] = []
+
+        # ── REMOTE_CONTROL session state (IDS-CAN-only gateways) ────────
+        # Session ID 4 (0x0004) is opened with a specific relay device before
+        # COMMAND frames; kept alive via 4-second heartbeats.
+        self._rc_session_open: bool = False
+        self._rc_session_target: int | None = None  # device_id session is open with
+        self._rc_session_seed_future: asyncio.Future | None = None
+        self._rc_session_key_future: asyncio.Future | None = None
+        self._rc_session_last_status_code: int | None = None
+        self._rc_heartbeat_task: asyncio.Task | None = None
+        self._rc_session_lock: asyncio.Lock = asyncio.Lock()
+        self._can_time_source: int | None = None
+        # Source address used by official app host-side IDS-CAN requests.
+        self._gateway_can_address: int = 0xFA
+        self._can_local_host_claimed: bool = False
+        self._can_local_host_mac: bytes = self._make_can_local_host_mac()
+        self._can_local_host_identity_last_tx: float = 0.0
+        self._can_ble_gateway_version: str = "Unknown"
+        # CAN-only link keepalive task. Periodic lightweight discovery requests
+        # keep the gateway link active during idle periods.
+        self._can_keepalive_task: asyncio.Task | None = None
 
         # ── Data freshness tracking ──────────────────────────────────
         self._last_event_time: float = 0.0  # monotonic timestamp
@@ -315,10 +465,62 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @property
     def data_healthy(self) -> bool:
-        """Return True if we've received data recently (within 15s)."""
-        if not self._connected or self._last_event_time == 0.0:
+        """Return True if we've received data recently."""
+        if self._last_event_time == 0.0:
+            return False
+        # IDS-CAN BLE gateways may disconnect after each broadcast cycle
+        # and reconnect every ~5-10s.  Don't require _connected so entities stay available
+        # between cycles; use a 30s staleness window instead.
+        if self._can_ble_confirmed:
+            return (time.monotonic() - self._last_event_time) < 30.0
+        if not self._connected:
             return False
         return (time.monotonic() - self._last_event_time) < 15.0
+
+    @property
+    def is_can_ble_gateway(self) -> bool:
+        """True for IDS-CAN BLE gateways that may disconnect each cycle."""
+        return self._can_ble_confirmed
+
+    @property
+    def can_ble_gateway_version(self) -> str:
+        """Official app gateway version selected for CAN BLE message packing."""
+        return self._can_ble_gateway_version
+
+    @property
+    def can_read_subscribed(self) -> bool:
+        """True while the live CAN_READ notification subscription is active."""
+        return self._can_read_subscribed
+
+    @property
+    def gateway_can_address(self) -> int:
+        """LocalHost source address used for IDS-CAN requests."""
+        return self._gateway_can_address
+
+    @property
+    def can_local_host_mac(self) -> str:
+        """Pseudo LocalHost MAC advertised on the IDS-CAN bus."""
+        return self._can_local_host_mac.hex()
+
+    @property
+    def can_device_types(self) -> dict[int, int]:
+        """Discovered IDS-CAN device type by source address."""
+        return dict(self._can_device_types)
+
+    @property
+    def can_command_queue_size(self) -> int:
+        """Number of CAN commands queued for the next reconnect window."""
+        return len(self._can_commands_queue)
+
+    @property
+    def remote_control_session_open(self) -> bool:
+        """True when the coordinator believes REMOTE_CONTROL session 4 is open."""
+        return self._rc_session_open
+
+    @property
+    def remote_control_session_target(self) -> int | None:
+        """Device address for the current REMOTE_CONTROL session, if any."""
+        return self._rc_session_target
 
     @property
     def last_event_age(self) -> float | None:
@@ -326,6 +528,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._last_event_time == 0.0:
             return None
         return time.monotonic() - self._last_event_time
+
+    def _make_can_local_host_mac(self) -> bytes:
+        """Make a stable pseudo-random MAC for this HA IDS-CAN local host.
+
+        Official CAN adapters do not reuse the BLE gateway MAC for LocalHost;
+        ``CanAdapterFactory.MakeMac`` generates a random six-byte address for
+        the app-side IDS-CAN adapter.  Use a stable hash so HA keeps the same
+        identity across reconnects/restarts without colliding with the gateway.
+        """
+        seed = f"ha-onecontrol-localhost:{self.entry.entry_id}:{self.address}".encode("utf-8")
+        mac = bytearray(hashlib.sha256(seed).digest()[:6])
+        if all(b == 0x00 for b in mac):
+            mac[0] = 0x01
+        return bytes(mac)
 
     def device_name(self, table_id: int, device_id: int) -> str:
         """Return friendly name or fallback like 'Device 0B:05'."""
@@ -354,10 +570,99 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.debug("TX command (%d bytes raw): %s", len(raw_command), raw_command.hex())
         await self._client.write_gatt_char(DATA_WRITE_CHAR_UUID, encoded, response=False)
 
+    def _encode_ble_v2_twenty_nine_bit(self, frame: bytes) -> bytes:
+        """Encode raw extended IDS-CAN wire frame into BLE V2 TwentyNineBit format.
+
+        BLE V2 frame layout: [0x03][can_id(4)][dlc][payload].
+        """
+        wire = parse_ids_can_wire_frame(frame)
+        if wire is None or not wire.is_extended:
+            return frame
+        can_id = ((wire.message_type & 0xFF) << 24) | ((wire.source_address & 0xFF) << 16)
+        can_id |= ((wire.target_address or 0) & 0xFF) << 8
+        can_id |= (wire.message_data or 0) & 0xFF
+        return bytes([0x03]) + can_id.to_bytes(4, "big") + bytes([wire.dlc & 0xFF]) + wire.payload
+
+    async def _write_can_frame(self, client: BleakClient, frame: bytes, *, label: str) -> None:
+        """Write IDS-CAN frame to CAN_WRITE with gateway-specific framing."""
+        # Official app path writes CAN adapter frames directly to IDS CAN WRITE.
+        # Keep TX as raw IDS wire frame (e.g. [dlc][id(4)][payload] for 29-bit)
+        # instead of wrapping in BLE V2 0x03 format.
+        _LOGGER.debug("CAN BLE: %s RAW tx=%s", label, frame.hex())
+        await client.write_gatt_char(CAN_WRITE_CHAR_UUID, frame, response=False)
+
+    def _is_can_ble_v1_gateway(self) -> bool:
+        """Return True when official app would use IdsCanSessionManagerAuto."""
+        return self._can_ble_gateway_version == "V1"
+
+    async def async_can_switch(self, device_id: int, state: bool) -> None:
+        """Send relay on/off via IDS-CAN COMMAND frame to CAN_WRITE.
+
+        If the gateway is currently disconnected (normal for some IDS-CAN BLE gateways),
+        the command is queued and sent at the start of the next connection window.
+        """
+        if self._client and self._connected and self._can_read_subscribed:
+            await self._advertise_can_local_host_identity(
+                self._client, reason="pre-command", force=True
+            )
+            # Official command runner activates REMOTE_CONTROL first.  Even
+            # for observed V1/24955 gateways, Type2 relays require explicit
+            # session seed/key before accepting COMMAND frames from HA.
+            session_ok = await self._ensure_remote_control_session(self._client, device_id)
+            if not session_ok:
+                _LOGGER.warning(
+                    "CAN BLE: relay COMMAND skipped — REMOTE_CONTROL activation failed for device=0x%02X gateway_version=%s",
+                    device_id,
+                    self._can_ble_gateway_version,
+                )
+                return
+
+            # RelayBasicLatching Type2 parity: command byte goes in message_data
+            # (0x01=ON, 0x00=OFF), payload is empty, source is current LocalHost.
+            frame = compose_ids_can_extended_wire_frame(
+                message_type=0x82,   # COMMAND
+                source_address=self._gateway_can_address,
+                target_address=device_id,
+                message_data=0x01 if state else 0x00,
+                payload=b"",
+            )
+            _LOGGER.info(
+                "CAN BLE: relay COMMAND device=0x%02X src=0x%02X state=%s gateway_version=%s frame=%s",
+                device_id,
+                self._gateway_can_address,
+                "ON" if state else "OFF",
+                self._can_ble_gateway_version,
+                frame.hex(),
+            )
+            try:
+                await self._write_can_frame(self._client, frame, label="relay COMMAND")
+            except BleakError as exc:
+                _LOGGER.warning("CAN BLE: relay COMMAND failed: %s", exc)
+        else:
+            frame = compose_ids_can_extended_wire_frame(
+                message_type=0x82,
+                source_address=self._gateway_can_address,
+                target_address=device_id,
+                message_data=0x01 if state else 0x00,
+                payload=b"",
+            )
+            _LOGGER.info(
+                "CAN BLE: gateway disconnected — queuing relay COMMAND device=0x%02X state=%s and reconnecting immediately",
+                device_id, "ON" if state else "OFF",
+            )
+            self._can_commands_queue.append((frame, time.monotonic(), device_id))
+            # Cancel any pending backoff timer and connect right now so the
+            # command is delivered in the next ~1-2s rather than waiting up to 5s.
+            self._cancel_reconnect()
+            self.hass.async_create_task(self.async_connect())
+
     async def async_switch(
         self, table_id: int, device_id: int, state: bool
     ) -> None:
         """Send a switch on/off command."""
+        if self._can_ble_confirmed:
+            await self.async_can_switch(device_id, state)
+            return
         cmd = self._cmd.build_action_switch(table_id, state, [device_id])
         await self.async_send_command(cmd)
 
@@ -754,6 +1059,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Reference: Android requestLockoutClear() — MyRvLinkBleManager.kt
         """
+        if self._can_ble_confirmed:
+            _LOGGER.warning(
+                "Lockout clear ignored for IDS-CAN BLE gateway — MyRVLink 0x55/0xAA sequence is not a CAN frame"
+            )
+            return
+
         now = time.monotonic()
         if now - self._last_lockout_clear < LOCKOUT_CLEAR_THROTTLE:
             _LOGGER.warning("Lockout clear throttled (min %ss)", LOCKOUT_CLEAR_THROTTLE)
@@ -784,6 +1095,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_refresh_metadata(self) -> None:
         """Re-request device metadata for all known table IDs."""
+        if self._can_ble_confirmed:
+            _LOGGER.info(
+                "Refresh Metadata ignored for IDS-CAN BLE gateway — names are learned from DEVICE_ID broadcasts"
+            )
+            return
+
         # Reset per-table state so all tables can be re-requested
         self._metadata_requested_tables.clear()
         self._metadata_loaded_tables.clear()
@@ -900,19 +1217,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self.address, stale_exc,
                     )
 
-        # PIN gateways require bonding before any connection can succeed.
-        # If bonding hasn't succeeded yet, skip direct adapter fallback —
-        # unbonded connects will fail and each attempt leaves BlueZ with
-        # a pending InProgress state that blocks all subsequent attempts.
-        if self.is_pin_gateway and not self._pin_dbus_succeeded:
-            _LOGGER.warning(
-                "PIN gateway %s: D-Bus bonding did not succeed — skipping "
-                "direct adapter fallback.  Ensure the gateway PIN is correct "
-                "and the device is powered on and in pairing mode.",
-                self.address,
-            )
-            raise last_exc
-
         # All HA-routed attempts failed — try direct HCI adapters as fallback.
         # This handles the case where the ESPHome BT proxy has no free slots
         # but a local USB/onboard adapter can reach the gateway.
@@ -958,7 +1262,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @property
     def is_pin_gateway(self) -> bool:
-        """True if this gateway uses PIN-based (legacy) BLE pairing."""
+        """True if this gateway uses PIN-based BLE pairing."""
         return self._pairing_method == "pin"
 
     async def _try_connect(self, attempt: int) -> None:
@@ -999,7 +1303,35 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "Bond check %s: locally_bonded=%s local_macs=%s candidate_sources=%s",
             self.address, locally_bonded, local_macs, candidate_sources,
         )
-        if locally_bonded and candidates:
+
+        # ── PIN gateways must always use a local HCI adapter ────────────────
+        # BlueZ D-Bus pairing (required for PIN/passkey exchange) does not work
+        # through ESPHome BT proxies — the proxy radio is remote and BlueZ
+        # cannot perform SMP key exchange over it.  Force local HCI regardless
+        # of adapter scores, bond state, or CONF_BONDED_SOURCE.
+        if self.is_pin_gateway and candidates:
+            _pin_local = next(
+                (c for c in candidates
+                 if c.scanner.source.upper().replace(":", "") in
+                    {m.replace(":", "") for m in local_macs}),
+                None,
+            )
+            if _pin_local is not None:
+                device = _pin_local.ble_device
+                self._current_connect_source = _pin_local.scanner.source
+                _LOGGER.info(
+                    "PIN gateway %s: forcing local HCI adapter %s "
+                    "(proxy pairing unsupported)",
+                    self.address, self._current_connect_source,
+                )
+            else:
+                _LOGGER.warning(
+                    "PIN gateway %s: no local HCI scanner visible — "
+                    "will attempt via proxy but pairing will likely fail",
+                    self.address,
+                )
+
+        if device is None and locally_bonded and candidates:
             local_candidate = next(
                 (c for c in candidates
                  if c.scanner.source.upper().replace(":", "") in
@@ -1042,11 +1374,21 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass, self.address, connectable=True
             )
             if device is not None and candidates:
-                # Capture the source so we can persist it on auth success
-                matched = next(
-                    (c for c in candidates if c.ble_device.address.upper() == device.address.upper()),
+                # Capture the source so we can persist it on auth success.
+                # Prefer a local HCI adapter (MAC-address source) over a proxy
+                # so that the D-Bus agent works and the LTK is stored locally.
+                addr_upper = self.address.upper()
+                addr_candidates = [
+                    c for c in candidates
+                    if c.ble_device.address.upper() == addr_upper
+                ]
+                local_preferred = next(
+                    (c for c in addr_candidates
+                     if c.scanner.source.upper().replace(":", "") in
+                        {m.replace(":", "") for m in local_macs}),
                     None,
                 )
+                matched = local_preferred or (addr_candidates[0] if addr_candidates else None)
                 self._current_connect_source = matched.scanner.source if matched else None
 
         if device is None:
@@ -1165,6 +1507,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.async_set_updated_data(self._build_data())
         _LOGGER.info("Connected to %s", self.address)
 
+        # Official parity: request MTU 185 when supported.
+        # Keep this best-effort so older backends/paths continue to work.
+        try:
+            if hasattr(client, "request_mtu"):
+                mtu = await client.request_mtu(185)
+                _LOGGER.debug("Requested MTU 185, negotiated=%s", mtu)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("MTU request not supported or failed: %s", exc)
+
         # ── Pairing ────────────────────────────────────────────────────
         if not self.is_pin_gateway:
             # PushButton: D-Bus Just Works pairing ran pre-connect; call pair()
@@ -1186,53 +1537,19 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.info("pair() not implemented — may already be bonded")
                 except Exception as exc:
                     _LOGGER.warning("pair() failed: %s — continuing", exc)
-        elif self._pin_agent_ctx and self._pin_agent_ctx.already_bonded:
-            # Already bonded in BlueZ — no re-pairing needed.
-            _LOGGER.info("PIN gateway %s — already bonded, skipping pair()", self.address)
-            await self._pin_agent_ctx.cleanup()
-            self._pin_agent_ctx = None
-        elif self._pin_agent_ctx:
-            # Agent is registered and waiting.  Call pair() now — BlueZ will
-            # invoke our agent's RequestPinCode/RequestPasskey.
-            # This matches Android: createBond() in onConnectionStateChange.
-            _LOGGER.info(
-                "PIN gateway %s — calling pair() with D-Bus agent active",
-                self.address,
-            )
-            try:
-                if hasattr(client, "pair"):
-                    await client.pair()
-                    _LOGGER.info(
-                        "PIN bonding completed for %s (agent responded: %s)",
-                        self.address,
-                        self._pin_agent_ctx.agent_responded,
-                    )
-                    self._pin_dbus_succeeded = True
-                else:
-                    _LOGGER.warning("pair() not available — PIN bonding may fail")
-            except NotImplementedError:
-                _LOGGER.warning("pair() not implemented — PIN gateway may fail to authenticate")
-            except Exception as exc:
-                _LOGGER.warning("PIN pair() failed: %s", exc)
-            finally:
+        else:
+            # PIN gateways: skip BLE SMP pair() entirely.
+            # These gateways authenticate at the GATT application layer via
+            # TEA key exchange (UNLOCK_STATUS/KEY characteristics). Calling
+            # pair() causes an immediate AuthenticationFailed — the device
+            # does not use SMP bonding at all.
+            if self._pin_agent_ctx:
                 await self._pin_agent_ctx.cleanup()
                 self._pin_agent_ctx = None
-        else:
-            # D-Bus not available (non-Linux / dev machine).
             _LOGGER.info(
-                "PIN gateway %s — D-Bus not available, attempting Bleak pair() without agent",
+                "PIN gateway %s — skipping BLE pair(), authenticating via GATT TEA",
                 self.address,
             )
-            try:
-                if hasattr(client, "pair"):
-                    paired = await client.pair()
-                    _LOGGER.info("Bleak pair() result: %s", paired)
-                else:
-                    _LOGGER.warning("pair() not available on client wrapper")
-            except NotImplementedError:
-                _LOGGER.warning("pair() not implemented on this backend")
-            except Exception as exc:
-                _LOGGER.warning("Bleak pair() failed: %s", exc)
 
         await asyncio.sleep(0.5)
 
@@ -1242,25 +1559,37 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if services:
                 svc_uuids = [s.uuid for s in services]
                 _LOGGER.info("GATT services: %s", svc_uuids)
-                # Check for CAN_WRITE characteristic (preferred lockout clear path)
+                # Check for CAN_WRITE and UNLOCK_STATUS to identify gateway protocol
+                _has_unlock_status = False
                 for svc in services:
                     for char in svc.characteristics:
                         if char.uuid == CAN_WRITE_CHAR_UUID:
                             self._has_can_write = True
                             _LOGGER.info("CAN_WRITE characteristic available")
-                            break
+                        if char.uuid == UNLOCK_STATUS_CHAR_UUID:
+                            _has_unlock_status = True
+                # CAN-only gateways expose CAN service but no MyRvLink AUTH service
+                if self._has_can_write and not _has_unlock_status:
+                    self._is_can_ble = True
+                    _LOGGER.info(
+                        "CAN-only gateway detected (no UNLOCK_STATUS) — will use IDS-CAN BLE path"
+                    )
             else:
                 _LOGGER.warning("No GATT services discovered")
         except Exception as exc:
             _LOGGER.warning("Failed to enumerate services: %s", exc)
 
-        # ── Step 1: Data Service Auth ─────────────────────────────────
-        await self._authenticate_step1(client)
+        if self._is_can_ble:
+            # ── CAN-only path ──────────────────────────────────────────
+            await self._authenticate_can_ble(client)
+        else:
+            # ── Step 1: Data Service Auth ─────────────────────────────────
+            await self._authenticate_step1(client)
 
-        await asyncio.sleep(NOTIFICATION_ENABLE_DELAY)
+            await asyncio.sleep(NOTIFICATION_ENABLE_DELAY)
 
-        # ── Enable notifications ──────────────────────────────────────
-        await self._enable_notifications(client)
+            # ── Enable notifications ──────────────────────────────────────
+            await self._enable_notifications(client)
 
         _LOGGER.info("OneControl %s — notifications enabled, waiting for SEED", self.address)
 
@@ -1270,10 +1599,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # so startup commands stay serialized.
 
         # ── Persist bonded source ─────────────────────────────────────
-        # Step 1 auth succeeded (reached here without exception), so the
-        # adapter/proxy used for this connection holds a valid bond.  Store
-        # it so future connects are pinned to the same source.
-        if self._current_connect_source is not None:
+        # Only persist when authentication actually succeeded so that a failed
+        # pairing attempt doesn't lock future connects to the wrong adapter.
+        # For PIN gateways the bond is only valid when D-Bus pairing completed
+        # (_pin_dbus_succeeded).  For non-PIN gateways, step 1 auth is enough.
+        _pairing_ok = self._authenticated
+        if self._current_connect_source is not None and _pairing_ok:
             stored_source = self.entry.options.get(CONF_BONDED_SOURCE)
             if stored_source != self._current_connect_source:
                 _LOGGER.info(
@@ -1287,6 +1618,959 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         CONF_BONDED_SOURCE: self._current_connect_source,
                     },
                 )
+
+    # ------------------------------------------------------------------
+    # CAN BLE gateway path (Unity XZ and similar IDS-CAN-only devices)
+    # ------------------------------------------------------------------
+
+    async def _authenticate_can_ble(self, client: BleakClient) -> None:
+        """Authenticate a CAN-only gateway and subscribe to IDS-CAN frames.
+
+        1. Try official CAN-BLE key/seed unlock (chars 00000012/00000013) when present.
+        2. Read PASSWORD_UNLOCK (char 00000005): if locked, write gateway_pin as UTF-8.
+        3. Subscribe CAN_READ (char 00000002) to receive inbound IDS-CAN frames.
+          4. Mark authenticated and optionally send one DEVICE_ID broadcast when
+              no devices are known yet.
+        """
+        _LOGGER.info("CAN BLE gateway %s — starting IDS-CAN authentication", self.address)
+
+        # --- Official CAN-BLE key/seed unlock ---
+        # BleManager performs this before BleCommunicationsAdapter opens the CAN
+        # service on X180T-style gateways.  It is harmless on gateways that do not
+        # expose these characteristics and may be required before writes are honored.
+        try:
+            seed_data = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
+            if seed_data.lower() == b"unlocked":
+                _LOGGER.info("CAN BLE: key/seed unlock already verified")
+            elif len(seed_data) >= 4:
+                seed = bytes(seed_data[:4])
+                key = calculate_can_ble_key_seed_key(seed)
+                _LOGGER.info("CAN BLE: key/seed unlock seed=%s key=computed", seed.hex())
+                await client.write_gatt_char(KEY_CHAR_UUID, key, response=True)
+                await asyncio.sleep(0.5)
+                verify = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
+                _LOGGER.info("CAN BLE: key/seed unlock verify=%s", verify.hex())
+            else:
+                _LOGGER.debug("CAN BLE: key/seed unlock seed unavailable: %s", seed_data.hex())
+        except BleakError as exc:
+            _LOGGER.debug("CAN BLE: key/seed unlock not available (%s)", exc)
+        except Exception as exc:
+            _LOGGER.warning("CAN BLE: key/seed unlock failed (%s) — proceeding", exc)
+
+        # --- Gateway protocol version ---
+        # Official app selects session strategy from this value:
+        # V1 => IdsCanSessionManagerAuto (no explicit seed/key), V2/V2_D => explicit session open.
+        try:
+            version_data = bytes(await client.read_gatt_char(CAN_VERSION_CHAR_UUID))
+            decoded_version = _official_can_ble_gateway_version_from_part(version_data)
+            self._can_ble_gateway_version = decoded_version
+            _LOGGER.info(
+                "CAN BLE: software part/version char=%s official_gateway_version=%s",
+                version_data.hex(),
+                decoded_version,
+            )
+        except BleakError as exc:
+            _LOGGER.info(
+                "CAN BLE: software part/version char unavailable (%s); gateway_version remains %s",
+                exc,
+                self._can_ble_gateway_version,
+            )
+        except Exception as exc:
+            _LOGGER.warning("CAN BLE: software part/version decode failed (%s)", exc)
+
+        # --- PIN unlock ---
+        try:
+            lock_data = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
+            locked = len(lock_data) == 0 or lock_data[0] == 0x00
+            _LOGGER.info(
+                "CAN BLE: PASSWORD_UNLOCK read = %s (locked=%s)", lock_data.hex(), locked
+            )
+            if locked:
+                pin_bytes = self.gateway_pin.encode("utf-8")
+                _LOGGER.info("CAN BLE: writing gateway PIN to PASSWORD_UNLOCK")
+                await client.write_gatt_char(
+                    PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=True
+                )
+                await asyncio.sleep(1.0)
+                verify = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
+                if len(verify) == 0 or verify[0] == 0x00:
+                    _LOGGER.error(
+                        "CAN BLE: PIN unlock failed — verify=%s", verify.hex()
+                    )
+                    # Don't abort — proceed anyway; the gateway may still accept commands
+                else:
+                    _LOGGER.info("CAN BLE: PIN unlock verified = %s", verify.hex())
+        except BleakError as exc:
+            _LOGGER.warning(
+                "CAN BLE: PASSWORD_UNLOCK char not accessible (%s) — proceeding", exc
+            )
+
+        if self._can_ble_gateway_version == "Unknown":
+            try:
+                version_data = bytes(await client.read_gatt_char(CAN_VERSION_CHAR_UUID))
+                decoded_version = _official_can_ble_gateway_version_from_part(version_data)
+                self._can_ble_gateway_version = decoded_version
+                _LOGGER.info(
+                    "CAN BLE: post-unlock software part/version char=%s official_gateway_version=%s",
+                    version_data.hex(),
+                    decoded_version,
+                )
+            except BleakError as exc:
+                _LOGGER.info(
+                    "CAN BLE: post-unlock software part/version char unavailable (%s); gateway_version remains %s",
+                    exc,
+                    self._can_ble_gateway_version,
+                )
+            except Exception as exc:
+                _LOGGER.warning("CAN BLE: post-unlock software part/version decode failed (%s)", exc)
+
+        # --- Subscribe CAN_READ for inbound frames ---
+        try:
+            await client.start_notify(CAN_READ_CHAR_UUID, self._on_can_read)
+            _LOGGER.info("CAN BLE: subscribed to CAN_READ (%s)", CAN_READ_CHAR_UUID)
+        except BleakError as exc:
+            _LOGGER.warning("CAN BLE: could not subscribe CAN_READ: %s", exc)
+
+        self._authenticated = True
+        self._can_ble_confirmed = True
+        self._can_read_subscribed = True  # auth complete; live relay commands now safe
+        self.async_set_updated_data(self._build_data())
+        _LOGGER.info("CAN BLE gateway %s — authenticated", self.address)
+
+        # Small gap so GATT notifications settle before writing
+        await asyncio.sleep(0.2)
+
+        # Official IDS-CAN adapters enable a LocalHost, wait for the bus to settle,
+        # claim an unused source address with a NETWORK broadcast, then use that
+        # claimed address for session and command traffic.  Without this, devices
+        # may ignore session requests from an unknown source.
+        await self._claim_can_local_host_address(client)
+
+        # --- Flush any commands queued while gateway was between connections ---
+        await self._flush_can_commands(client)
+
+        # --- Kick off discovery and start link keepalive ---
+        await self._send_can_device_discovery(client)
+        if self._can_keepalive_task and not self._can_keepalive_task.done():
+            self._can_keepalive_task.cancel()
+        self._can_keepalive_task = self.hass.async_create_background_task(
+            self._can_keepalive_loop(client), name="ha_onecontrol_can_keepalive"
+        )
+
+    def _on_can_read(
+        self, characteristic: BleakGATTCharacteristic, data: bytearray
+    ) -> None:
+        """Handle a CAN_READ notification — decode V2 BLE wrapper and dispatch entity events.
+
+        V2 BLE frame types (byte 0):
+          0x01 = Packed  → NETWORK + DEVICE_ID + DEVICE_STATUS + FakeCircuitID
+          0x02 = ElevenBit → one 11-bit IDS-CAN frame
+          0x03 = TwentyNineBit → one 29-bit IDS-CAN frame
+        All other values: try V1 raw IDS-CAN parse directly.
+        """
+        raw = bytes(data)
+        _LOGGER.debug("CAN RX raw (%d bytes): %s", len(raw), raw.hex())
+        can_frames = _decode_v2_ble_can_frames(raw)
+        if not can_frames:
+            # V1 or unrecognised — try raw parse
+            wire = parse_ids_can_wire_frame(raw)
+            if wire is None:
+                _LOGGER.warning("CAN RX: unrecognised frame %s", raw.hex())
+                return
+            if self._can_ble_gateway_version == "Unknown":
+                self._can_ble_gateway_version = "V1"
+                _LOGGER.info(
+                    "CAN BLE: inferred official_gateway_version=V1 from raw CAN_READ notification"
+                )
+            can_frames = [raw]
+        for can_frame in can_frames:
+            wire = parse_ids_can_wire_frame(can_frame)
+            if wire is None:
+                continue
+            decoded = decode_ids_can_payload(wire)
+            if wire.message_type == 0x07:
+                self._can_time_source = wire.source_address & 0xFF
+            if self._rc_session_seed_future is not None or self._rc_session_key_future is not None:
+                _LOGGER.debug(
+                    "CAN BLE: SESSION_WAIT RX mt=0x%02X src=0x%02X tgt=%s mdata=%s payload=%s",
+                    wire.message_type,
+                    wire.source_address,
+                    f"0x{wire.target_address:02X}" if wire.target_address is not None else "N/A",
+                    f"0x{wire.message_data:02X}" if wire.message_data is not None else "N/A",
+                    wire.payload.hex(),
+                )
+            _LOGGER.debug(
+                "PACKET RX IDS mt=0x%02X(%s) src=0x%02X tgt=%s mdata=%s dlc=%d payload=%s%s",
+                wire.message_type,
+                ids_can_message_type_name(wire.message_type),
+                wire.source_address,
+                f"0x{wire.target_address:02X}" if wire.target_address is not None else "N/A",
+                f"0x{wire.message_data:02X}" if wire.message_data is not None else "N/A",
+                wire.dlc,
+                wire.payload.hex(),
+                format_ids_can_payload(decoded),
+            )
+            # Learn controller source only from extended request/command traffic.
+            # DEVICE_STATUS/NETWORK source addresses are often endpoint devices,
+            # not the host-side controller address used for outgoing requests.
+            if (
+                wire.is_extended
+                and decoded is not None
+                and decoded.kind in {"request", "command"}
+                and not self._can_local_host_claimed
+            ):
+                learned_source = wire.source_address & 0xFF
+                if learned_source != self._gateway_can_address:
+                    _LOGGER.info(
+                        "CAN BLE: controller source learned from bus traffic 0x%02X -> 0x%02X",
+                        self._gateway_can_address,
+                        learned_source,
+                    )
+                    self._gateway_can_address = learned_source
+            if wire.message_type >= 0x80:
+                _LOGGER.debug(
+                    "CAN BLE: EXT RX mt=0x%02X src=0x%02X tgt=%s mdata=%s payload=%s",
+                    wire.message_type,
+                    wire.source_address,
+                    f"0x{wire.target_address:02X}" if wire.target_address is not None else "N/A",
+                    f"0x{wire.message_data:02X}" if wire.message_data is not None else "N/A",
+                    wire.payload.hex(),
+                )
+            # Session RESPONSE frames are handled separately; do not dispatch
+            # as entity events.
+            if wire.message_type == 0x81 and wire.message_data in (0x42, 0x43, 0x44, 0x45):
+                _LOGGER.debug(
+                    "CAN BLE: SESSION_RESPONSE rx src=0x%02X dst=0x%02X mdata=0x%02X payload=%s",
+                    wire.source_address,
+                    wire.target_address or 0,
+                    wire.message_data or 0,
+                    wire.payload.hex(),
+                )
+                self._handle_session_response(wire)
+                continue
+            self._dispatch_can_entity(wire, decoded)
+
+    def _dispatch_can_entity(
+        self,
+        wire: "IdsCanWireFrame",
+        decoded: "IdsCanDecodedPayload | None",
+    ) -> None:
+        """Map DEVICE_ID and DEVICE_STATUS IDS-CAN frames to HA entity state.
+
+        DEVICE_ID (mt=0x02): cache device_type and populate device_names so
+            entity platforms can display a human-readable label.
+        DEVICE_STATUS (mt=0x03): construct a CoverStatus or RelayStatus and
+            fire the coordinator event callbacks so cover/sensor platforms
+            create or update their entities.
+
+        Convention: table_id=0, device_id=source_address (IDS-CAN bus has no
+        table concept; each gateway coordinator is a single-bus instance).
+        """
+        mt = wire.message_type
+        src = wire.source_address
+
+        if mt == 0x00 and decoded is not None:  # NETWORK — synthesize gateway_info + lockout
+            proto = int(decoded.fields.get("protocol_version", 0))
+            lockout = int(decoded.fields.get("in_motion_lockout_level", 0))
+            self.system_lockout_level = lockout
+            self.gateway_info = GatewayInformation(
+                protocol_version=proto,
+                table_id=0,
+                device_count=len(self._can_device_types),
+            )
+            self._last_event_time = time.monotonic()
+            self.async_set_updated_data(self._build_data())
+            return
+
+        if mt == 0x02 and decoded is not None:  # DEVICE_ID
+            dev_type = int(decoded.fields.get("device_type", 0))
+            label = str(decoded.fields.get("function_label", f"Device 0x{src:02X}"))
+            self._can_device_types[src] = dev_type
+            self.device_names[_device_key(0, src)] = label
+            # Refresh device_count in gateway_info after each new device is seen
+            if self.gateway_info is not None:
+                self.gateway_info = GatewayInformation(
+                    protocol_version=self.gateway_info.protocol_version,
+                    table_id=0,
+                    device_count=len(self._can_device_types),
+                )
+            return
+
+        if mt != 0x03:  # only DEVICE_STATUS triggers entity updates
+            return
+
+        dev_type = self._can_device_types.get(src)
+        if dev_type is None:
+            return  # DEVICE_ID not yet seen for this source
+
+        payload = wire.payload
+        key = _device_key(0, src)
+        event: CoverStatus | RelayStatus | None = None
+
+        if dev_type == 33:  # H-Bridge / cover (slide-out, awning)
+            status = payload[0] if len(payload) >= 1 else 0xC0
+            pos: int | None = payload[1] if len(payload) >= 2 else None
+            if pos == 0xFF:
+                pos = None
+            event = CoverStatus(table_id=0, device_id=src, status=status, position=pos)
+            self.covers[key] = event
+
+        elif dev_type == 30:  # Relay (light, switch)
+            status_byte = payload[0] if len(payload) >= 1 else 0x00
+            is_on = (status_byte & 0x0F) == 0x01
+            event = RelayStatus(
+                table_id=0, device_id=src, is_on=is_on, status_byte=status_byte
+            )
+            self.relays[key] = event
+
+        if event is not None:
+            self._last_event_time = time.monotonic()
+            for cb in self._event_callbacks:
+                try:
+                    cb(event)
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("Error in CAN entity callback")
+            self.async_set_updated_data(self._build_data())
+
+    async def _send_can_device_discovery(self, client: BleakClient) -> None:
+        """Broadcast a DEVICE_ID REQUEST to enumerate all devices on the IDS-CAN bus."""
+        try:
+            # REQUEST (0x80) + DEVICE_ID (0x02) broadcast to 0xFF, no payload
+            frame = compose_ids_can_extended_wire_frame(
+                message_type=0x80,
+                source_address=self._gateway_can_address,
+                target_address=0xFF,  # broadcast
+                message_data=0x02,   # DEVICE_ID
+                payload=b"",
+            )
+            await self._write_can_frame(client, frame, label="DEVICE_ID discovery")
+            _LOGGER.debug(
+                "CAN BLE: sent DEVICE_ID broadcast (%s)", frame.hex()
+            )
+        except Exception as exc:
+            _LOGGER.warning("CAN BLE: failed to send device discovery: %s", exc)
+
+    def _choose_can_local_host_address(self) -> int:
+        """Choose a likely-unused IDS-CAN local host address.
+
+        Official ``AddressDetectManager`` keeps a randomized list of all valid
+        device addresses and returns the next one not seen during the initial
+        one-second listen window.  Do not prefer 0xFA or a learned controller
+        source; those may be real/reserved on some coaches.
+        """
+        observed = set(self._can_device_types.keys())
+        if self._can_time_source is not None:
+            observed.add(self._can_time_source & 0xFF)
+        candidates = [candidate for candidate in range(0x01, 0xFF) if candidate not in observed]
+        if candidates:
+            seed = hashlib.sha256(self._can_local_host_mac + self.address.encode("utf-8")).digest()
+            start = int.from_bytes(seed[:2], "big") % len(candidates)
+            for offset in range(len(candidates)):
+                candidate = candidates[(start + offset) % len(candidates)]
+                if candidate not in (0x00, 0xFF):
+                    return candidate
+        for candidate in range(0x01, 0xFF):
+            if candidate not in (0x00, 0xFF):
+                return candidate
+        return 0xFA
+
+    async def _claim_can_local_host_address(self, client: BleakClient) -> None:
+        """Claim the HA local host IDS-CAN source address like official LocalDevice."""
+        if self._can_local_host_claimed:
+            return
+        # Official AddressDetectManager listens for one second before choosing.
+        await asyncio.sleep(1.05)
+        claimed = self._choose_can_local_host_address()
+        self._gateway_can_address = claimed
+
+        claim_payload = bytes([claimed, 0x12]) + self._can_local_host_mac
+        claim_frame = compose_ids_can_standard_wire_frame(
+            message_type=0x00,  # NETWORK
+            source_address=0xFF,  # ADDRESS.BROADCAST during address claim
+            payload=claim_payload,
+        )
+        _LOGGER.info(
+            "CAN BLE: LocalHost address-claim addr=0x%02X mac=%s frame=%s",
+            claimed,
+            self._can_local_host_mac.hex(),
+            claim_frame.hex(),
+        )
+        await self._write_can_frame(client, claim_frame, label="LocalHost ADDRESS_CLAIM")
+
+        # Wait out the official 1s claim window, then advertise as online from
+        # the claimed source.  Payload [status=0, version=0x12, mac6] mirrors
+        # LocalDevice.TransmitNetworkMessage().
+        await asyncio.sleep(1.05)
+        online_frame = compose_ids_can_standard_wire_frame(
+            message_type=0x00,
+            source_address=claimed,
+            payload=bytes([0x00, 0x12]) + self._can_local_host_mac,
+        )
+        _LOGGER.info(
+            "CAN BLE: LocalHost NETWORK online addr=0x%02X frame=%s",
+            claimed,
+            online_frame.hex(),
+        )
+        await self._write_can_frame(client, online_frame, label="LocalHost NETWORK")
+        self._can_local_host_claimed = True
+
+        # Official LocalDevice does not stop at address claim. Once online,
+        # its background task advertises the app-side LocalHost identity on
+        # the CAN bus before command traffic: NETWORK, PRODUCT_STATUS,
+        # DEVICE_ID, CIRCUIT_ID, and DEVICE_STATUS.  Some devices appear to
+        # gate REMOTE_CONTROL acceptance on this LocalHost identity being
+        # known, not just on the final COMMAND frame being correctly encoded.
+        await self._advertise_can_local_host_identity(
+            client, reason="post-claim", force=True
+        )
+
+    async def _advertise_can_local_host_identity(
+        self, client: BleakClient, *, reason: str, force: bool = False
+    ) -> None:
+        """Advertise HA's IDS-CAN LocalHost like official app LocalDevice.
+
+        Official app LocalHost is an Android mobile app IDS-CAN device:
+        PRODUCT_ID=46 (OneControl Android Mobile App), DEVICE_TYPE=22
+        (ANDROID_MOBILE_DEVICE), FUNCTION_NAME=2 (MYRV_TABLET), function
+        instance/device instance/capabilities all zero for non-touch-panel
+        Android builds. Product instance tracks the claimed CAN address.
+        """
+        if not self._can_local_host_claimed:
+            return
+
+        now = time.monotonic()
+        if not force and now - self._can_local_host_identity_last_tx < 10.0:
+            return
+
+        source = self._gateway_can_address & 0xFF
+        mac = self._can_local_host_mac
+
+        frames: list[tuple[str, bytes]] = [
+            (
+                "LocalHost NETWORK",
+                compose_ids_can_standard_wire_frame(
+                    message_type=0x00,
+                    source_address=source,
+                    payload=bytes([0x00, 0x12]) + mac,
+                ),
+            ),
+            (
+                "LocalHost PRODUCT_STATUS",
+                compose_ids_can_standard_wire_frame(
+                    message_type=0x06,
+                    source_address=source,
+                    payload=b"\x00",
+                ),
+            ),
+            (
+                "LocalHost DEVICE_ID",
+                compose_ids_can_standard_wire_frame(
+                    message_type=0x02,
+                    source_address=source,
+                    payload=bytes(
+                        [
+                            0x00,
+                            0x2E,  # PRODUCT_ID 46: OneControl Android Mobile App
+                            source,  # product instance == LocalProduct address
+                            0x16,  # DEVICE_TYPE 22: ANDROID_MOBILE_DEVICE
+                            0x00,
+                            0x02,  # FUNCTION_NAME 2: MYRV_TABLET
+                            0x00,  # device_instance=0, function_instance=0
+                            0x00,  # capabilities=0 for Android mobile app
+                        ]
+                    ),
+                ),
+            ),
+            (
+                "LocalHost CIRCUIT_ID",
+                compose_ids_can_standard_wire_frame(
+                    message_type=0x01,
+                    source_address=source,
+                    payload=b"\x00\x00\x00\x00",
+                ),
+            ),
+            (
+                "LocalHost DEVICE_STATUS",
+                compose_ids_can_standard_wire_frame(
+                    message_type=0x03,
+                    source_address=source,
+                    payload=b"",
+                ),
+            ),
+        ]
+
+        _LOGGER.debug(
+            "CAN BLE: advertising official LocalHost identity reason=%s src=0x%02X mac=%s",
+            reason,
+            source,
+            mac.hex(),
+        )
+        for label, frame in frames:
+            await self._write_can_frame(client, frame, label=label)
+            await asyncio.sleep(0.04)
+        self._can_local_host_identity_last_tx = time.monotonic()
+
+    async def _can_keepalive_loop(self, client: BleakClient) -> None:
+        """Keep CAN-only BLE links active during idle windows.
+
+        Some CAN-only gateways drop idle BLE links quickly unless periodic
+        host traffic is present. Send a lightweight discovery request every
+        few seconds while connected/authenticated.
+        """
+        try:
+            while (
+                self._connected
+                and self._authenticated
+                and self._can_read_subscribed
+                and self._client is client
+            ):
+                await asyncio.sleep(3.0)
+                if not (
+                    self._connected
+                    and self._authenticated
+                    and self._can_read_subscribed
+                    and self._client is client
+                ):
+                    break
+                # Avoid interleaving broadcast discovery traffic with
+                # REMOTE_CONTROL session open/heartbeat traffic.
+                if (
+                    self._rc_session_seed_future is not None
+                    or self._rc_session_key_future is not None
+                    or self._rc_session_open
+                ):
+                    continue
+                _LOGGER.debug("CAN BLE: keepalive tick")
+                await self._advertise_can_local_host_identity(
+                    client, reason="keepalive", force=False
+                )
+                await self._send_can_device_discovery(client)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("CAN BLE: keepalive loop ended due to error: %s", exc)
+
+    async def _flush_can_commands(self, client: BleakClient) -> None:
+        """Flush any relay/cover commands queued while the gateway was disconnected.
+
+        Commands older than 30 s are discarded as stale.
+        """
+        _CAN_CMD_TTL = 30.0
+        now = time.monotonic()
+        fresh = [(frame, t, did) for frame, t, did in self._can_commands_queue if now - t < _CAN_CMD_TTL]
+        stale = len(self._can_commands_queue) - len(fresh)
+        self._can_commands_queue.clear()
+        if stale:
+            _LOGGER.debug("CAN BLE: discarded %d stale queued command(s)", stale)
+        for frame, _, device_id in fresh:
+            try:
+                await self._advertise_can_local_host_identity(
+                    client, reason="pre-queued-command", force=True
+                )
+                # Open/activate REMOTE_CONTROL before sending the COMMAND frame.
+                if not await self._ensure_remote_control_session(client, device_id):
+                    _LOGGER.warning(
+                        "CAN BLE: queued COMMAND skipped — REMOTE_CONTROL activation failed for device=0x%02X gateway_version=%s",
+                        device_id,
+                        self._can_ble_gateway_version,
+                    )
+                    continue
+                parsed = parse_ids_can_wire_frame(frame)
+                command = parsed.message_data if parsed and parsed.message_data is not None else 0x00
+                current_frame = compose_ids_can_extended_wire_frame(
+                    message_type=0x82,
+                    source_address=self._gateway_can_address,
+                    target_address=device_id,
+                    message_data=command,
+                    payload=b"",
+                )
+                _LOGGER.info(
+                    "CAN BLE: flushing queued command src=0x%02X device=0x%02X frame=%s",
+                    self._gateway_can_address,
+                    device_id,
+                    current_frame.hex(),
+                )
+                await self._write_can_frame(client, current_frame, label="queued COMMAND")
+                await asyncio.sleep(0.1)
+            except Exception as exc:
+                _LOGGER.warning("CAN BLE: failed to flush queued command: %s", exc)
+
+    # ------------------------------------------------------------------
+    # REMOTE_CONTROL session management (IDS-CAN session ID 4)
+    # ------------------------------------------------------------------
+
+    _RC_SESSION_ID = 0x0004
+    _RC_SESSION_ID_HI = 0x00
+    _RC_SESSION_ID_LO = 0x04
+
+    def _handle_session_response(self, wire: "IdsCanWireFrame") -> None:
+        """Dispatch IDS-CAN RESPONSE (0x81) session frames to awaiting futures.
+
+        Called from _on_can_read for message_data values 0x42–0x45.
+        """
+        payload = wire.payload
+        msg = wire.message_data
+
+        # Some gateways return single-byte IDS status responses for session
+        # requests instead of full session payloads.
+        if len(payload) == 1 and msg in (0x42, 0x43):
+            status_code = payload[0] & 0xFF
+            self._rc_session_last_status_code = status_code
+            status_name = ids_can_response_name(status_code)
+            _LOGGER.warning(
+                "CAN BLE: SESSION_RESPONSE status req=0x%02X code=0x%02X(%s)",
+                msg,
+                status_code,
+                status_name,
+            )
+            err = RuntimeError(
+                f"session req 0x{msg:02X} rejected with 0x{status_code:02X}({status_name})"
+            )
+            if msg == 0x42 and self._rc_session_seed_future and not self._rc_session_seed_future.done():
+                self._rc_session_seed_future.set_exception(err)
+            if msg == 0x43 and self._rc_session_key_future and not self._rc_session_key_future.done():
+                self._rc_session_key_future.set_exception(err)
+            return
+
+        if len(payload) < 2:
+            return
+        # Validate that the session ID in the payload matches REMOTE_CONTROL.
+        sid = (payload[0] << 8) | payload[1]
+        if sid not in (self._RC_SESSION_ID, 0x0400):
+            return
+
+        if msg == 0x42:  # SESSION_REQUEST_SEED response — payload: [sid×2, seed×4]
+            if len(payload) == 6 and self._rc_session_seed_future and not self._rc_session_seed_future.done():
+                seed = int.from_bytes(payload[2:6], "big")
+                _LOGGER.debug("CAN BLE: session seed rx 0x%08X", seed)
+                self._rc_session_seed_future.set_result(seed)
+
+        elif msg == 0x43:  # SESSION_TRANSMIT_KEY response — payload: [sid×2]
+            if len(payload) == 2 and self._rc_session_key_future and not self._rc_session_key_future.done():
+                _LOGGER.debug("CAN BLE: session key confirmed — REMOTE_CONTROL session open")
+                self._rc_session_key_future.set_result(None)
+
+        elif msg in (0x44, 0x45):  # Device closing the session (heartbeat close / session end)
+            if len(payload) >= 3:
+                reason = payload[2]
+                _LOGGER.info(
+                    "CAN BLE: REMOTE_CONTROL session terminated by device, reason=0x%02X", reason
+                )
+            self._rc_session_open = False
+            self._rc_session_target = None
+            if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
+                self._rc_heartbeat_task.cancel()
+
+    async def _ensure_remote_control_session(
+        self, client: BleakClient, device_id: int
+    ) -> bool:
+        """Open a REMOTE_CONTROL IDS-CAN session with *device_id* if not yet open.
+
+        Protocol (from decompiled SessionClient.cs):
+          1. Send REQUEST(0x80) msg_data=0x42 payload=[0x00, 0x04] → seed request
+          2. Receive RESPONSE(0x81) msg_data=0x42 payload=[sid×2, seed×4]
+          3. Encrypt seed with TEA(REMOTE_CONTROL cypher from SESSION_ID descriptors)
+          4. Send REQUEST(0x80) msg_data=0x43 payload=[sid×2, key×4] → transmit key
+          5. Receive RESPONSE(0x81) msg_data=0x43 payload=[sid×2] → session open
+        Returns True when session is (already) open.
+        """
+        async with self._rc_session_lock:
+            v1_gateway = self._is_can_ble_v1_gateway()
+            if not v1_gateway and self._rc_session_open and self._rc_session_target == device_id:
+                return True
+
+            if v1_gateway:
+                _LOGGER.debug(
+                    "CAN BLE: V1/24955 gateway — opening explicit REMOTE_CONTROL seed/key after LocalHost identity src=0x%02X device=0x%02X",
+                    self._gateway_can_address,
+                    device_id,
+                )
+
+            # Cancel heartbeat for any previous session with a different device.
+            if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
+                self._rc_heartbeat_task.cancel()
+            self._rc_session_open = False
+            self._rc_session_target = None
+
+            _LOGGER.info(
+                "CAN BLE: opening REMOTE_CONTROL session with device 0x%02X", device_id
+            )
+            self._rc_session_last_status_code = None
+            sid_candidates = (bytes([self._RC_SESSION_ID_HI, self._RC_SESSION_ID_LO]),)
+
+            # ── Step 1: request seed ────────────────────────────────
+            loop = asyncio.get_running_loop()
+            source_candidates: list[int] = []
+            dynamic_time_source = None if v1_gateway else self._can_time_source
+            raw_source_candidates = (
+                (self._gateway_can_address,)
+                if v1_gateway
+                else (
+                    self._gateway_can_address,
+                    dynamic_time_source,
+                    0xFA,
+                    *sorted(self._can_device_types.keys()),
+                    0x3A,
+                    0x02,
+                    0x12,
+                )
+            )
+            for src in raw_source_candidates:
+                if src is None:
+                    continue
+                if src not in source_candidates:
+                    source_candidates.append(src)
+
+            selected_source: int | None = None
+            selected_target: int | None = None
+            selected_sid_bytes: bytes | None = None
+            seed: int | None = None
+
+            target_candidates: list[int] = []
+            raw_target_candidates = (device_id,) if v1_gateway else (device_id, self._can_time_source)
+            for dst in raw_target_candidates:
+                if dst is None:
+                    continue
+                if dst not in target_candidates:
+                    target_candidates.append(dst)
+
+            # Official IDS-CAN flow queries device sessions first
+            # (device.Sessions.QueryDevice()) before trying to open one.
+            # On some controllers this appears required before 0x42/0x43 are accepted.
+            _LOGGER.debug(
+                "CAN BLE: preflight call entering src=%s dst=%s",
+                ",".join(f"0x{s:02X}" for s in source_candidates),
+                ",".join(f"0x{d:02X}" for d in target_candidates),
+            )
+            await self._query_remote_control_sessions(
+                client=client,
+                source_candidates=source_candidates,
+                target_candidates=target_candidates,
+            )
+            _LOGGER.debug("CAN BLE: preflight call completed")
+
+            for dst in target_candidates:
+                for sid_bytes in sid_candidates:
+                    for src in source_candidates:
+                        seed_req = compose_ids_can_extended_wire_frame(
+                            message_type=0x80,
+                            source_address=src,
+                            target_address=dst,
+                            message_data=0x42,  # SESSION_REQUEST_SEED
+                            payload=sid_bytes,
+                        )
+                        self._rc_session_seed_future = loop.create_future()
+                        try:
+                            _LOGGER.debug(
+                                "CAN BLE: SESSION_REQUEST_SEED tx src=0x%02X dst=0x%02X sid=%s frame=%s",
+                                src,
+                                dst,
+                                sid_bytes.hex(),
+                                seed_req.hex(),
+                            )
+                            await self._write_can_frame(client, seed_req, label="SESSION_REQUEST_SEED")
+                            seed = await asyncio.wait_for(
+                                asyncio.shield(self._rc_session_seed_future), timeout=0.45
+                            )
+                            selected_source = src
+                            selected_target = dst
+                            selected_sid_bytes = sid_bytes
+                            break
+                        except asyncio.TimeoutError:
+                            _LOGGER.debug(
+                                "CAN BLE: SESSION_REQUEST_SEED timeout for src=0x%02X dst=0x%02X sid=%s",
+                                src,
+                                dst,
+                                sid_bytes.hex(),
+                            )
+                            continue
+                        except Exception as exc:
+                            _LOGGER.warning(
+                                "CAN BLE: SESSION_REQUEST_SEED error for src=0x%02X dst=0x%02X sid=%s: %s",
+                                src,
+                                dst,
+                                sid_bytes.hex(),
+                                exc,
+                            )
+                            continue
+                        finally:
+                            self._rc_session_seed_future = None
+                    if selected_source is not None:
+                        break
+                if selected_source is not None:
+                    break
+
+            if (
+                selected_source is None
+                or selected_target is None
+                or selected_sid_bytes is None
+                or seed is None
+            ):
+                if v1_gateway:
+                    _LOGGER.warning(
+                        "CAN BLE: explicit REMOTE_CONTROL seed timed out on V1/24955 device 0x%02X after LocalHost identity (src=%s dst=%s); falling back to official auto-session wrapper",
+                        device_id,
+                        ",".join(f"0x{s:02X}" for s in source_candidates),
+                        ",".join(f"0x{d:02X}" for d in target_candidates),
+                    )
+                    self._rc_session_open = False
+                    self._rc_session_target = device_id
+                    return True
+                else:
+                    _LOGGER.warning(
+                        "CAN BLE: REMOTE_CONTROL session seed timed out for device 0x%02X (tried src=%s dst=%s sid=0004)",
+                        device_id,
+                        ",".join(f"0x{s:02X}" for s in source_candidates),
+                        ",".join(f"0x{d:02X}" for d in target_candidates),
+                    )
+                    return False
+
+            if selected_source != self._gateway_can_address:
+                _LOGGER.info(
+                    "CAN BLE: session source accepted as 0x%02X (was 0x%02X)",
+                    selected_source,
+                    self._gateway_can_address,
+                )
+                self._gateway_can_address = selected_source
+
+            # ── Step 2: encrypt seed, transmit key ────────────────
+            key = tea_encrypt(RC_CYPHER, seed)
+            key_req = compose_ids_can_extended_wire_frame(
+                message_type=0x80,
+                source_address=selected_source,
+                target_address=selected_target,
+                message_data=0x43,  # SESSION_TRANSMIT_KEY
+                payload=selected_sid_bytes + key.to_bytes(4, "big"),
+            )
+            self._rc_session_key_future = loop.create_future()
+            try:
+                _LOGGER.debug(
+                    "CAN BLE: SESSION_TRANSMIT_KEY tx src=0x%02X dst=0x%02X frame=%s",
+                    selected_source,
+                    device_id,
+                    key_req.hex(),
+                )
+                await self._write_can_frame(client, key_req, label="SESSION_TRANSMIT_KEY")
+                await asyncio.wait_for(
+                    asyncio.shield(self._rc_session_key_future), timeout=3.0
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning("CAN BLE: REMOTE_CONTROL session key timed out for device 0x%02X", device_id)
+                self._rc_session_key_future = None
+                return False
+            except Exception as exc:
+                if self._rc_session_last_status_code is not None:
+                    _LOGGER.warning(
+                        "CAN BLE: REMOTE_CONTROL session key rejected for device 0x%02X status=0x%02X(%s)",
+                        device_id,
+                        self._rc_session_last_status_code,
+                        ids_can_response_name(self._rc_session_last_status_code),
+                    )
+                else:
+                    _LOGGER.warning("CAN BLE: REMOTE_CONTROL session key error: %s", exc)
+                self._rc_session_key_future = None
+                return False
+            finally:
+                self._rc_session_key_future = None
+
+            self._rc_session_open = True
+            self._rc_session_target = device_id
+            _LOGGER.info(
+                "CAN BLE: REMOTE_CONTROL session established for device 0x%02X", device_id
+            )
+            # SessionKeepAliveTime=0: no heartbeat needed — session expires naturally
+            # on the device side after ~5s of inactivity.
+            return True
+
+    async def _query_remote_control_sessions(
+        self,
+        client: BleakClient,
+        source_candidates: list[int],
+        target_candidates: list[int],
+    ) -> None:
+        """Query session list/status before requesting seed for REMOTE_CONTROL.
+
+        Decompiled official flow (IdsCanSessionManager.ActivateSessionAsync) calls
+        `device.Sessions.QueryDevice()` whenever no session object is present.
+                Official request payloads are not empty:
+                    0x40 = SESSION_READ_LIST   payload=[index_hi, index_lo]
+                    0x41 = SESSION_READ_STATUS payload=[session_hi, session_lo]
+        """
+        _LOGGER.debug(
+            "CAN BLE: session preflight begin src=%s dst=%s",
+            ",".join(f"0x{s:02X}" for s in source_candidates),
+            ",".join(f"0x{d:02X}" for d in target_candidates),
+        )
+        try:
+            sent = 0
+            for dst in target_candidates:
+                # Keep traffic small: probe with the first two most likely sources.
+                for src in source_candidates[:2]:
+                    preflight_requests = (
+                        (0x40, "SESSION_READ_LIST", b"\x00\x00"),
+                        # The first read-list response can report up to two supported
+                        # sessions; index 1 mirrors the official paged query if more
+                        # than two are present.
+                        (0x40, "SESSION_READ_LIST", b"\x00\x01"),
+                        (0x41, "SESSION_READ_STATUS", bytes([self._RC_SESSION_ID_HI, self._RC_SESSION_ID_LO])),
+                    )
+                    for req_code, label, payload in preflight_requests:
+                        frame = compose_ids_can_extended_wire_frame(
+                            message_type=0x80,
+                            source_address=src,
+                            target_address=dst,
+                            message_data=req_code,
+                            payload=payload,
+                        )
+                        _LOGGER.debug(
+                            "CAN BLE: %s preflight tx src=0x%02X dst=0x%02X payload=%s frame=%s",
+                            label,
+                            src,
+                            dst,
+                            payload.hex(),
+                            frame.hex(),
+                        )
+                        await self._write_can_frame(client, frame, label=label)
+                        sent += 1
+                        await asyncio.sleep(0.05)
+            if sent:
+                # Allow quick processing window before seed request loop.
+                await asyncio.sleep(0.20)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("CAN BLE: session preflight query failed: %s", exc)
+
+    async def _rc_session_heartbeat(self, client: BleakClient, device_id: int) -> None:
+        """Send SESSION_HEARTBEAT (0x44) every 4 s to keep REMOTE_CONTROL session alive.
+
+        The device closes the session if no heartbeat arrives within 5 s.
+        """
+        sid_bytes = bytes([self._RC_SESSION_ID_HI, self._RC_SESSION_ID_LO])
+        hb_frame = compose_ids_can_extended_wire_frame(
+            message_type=0x80,
+            source_address=self._gateway_can_address,
+            target_address=device_id,
+            message_data=0x44,  # SESSION_HEARTBEAT
+            payload=sid_bytes,
+        )
+        try:
+            while self._rc_session_open and self._rc_session_target == device_id and self._connected:
+                await asyncio.sleep(4.0)
+                if not (self._rc_session_open and self._rc_session_target == device_id and self._connected):
+                    break
+                try:
+                    await self._write_can_frame(client, hb_frame, label="SESSION_HEARTBEAT")
+                    _LOGGER.debug(
+                        "CAN BLE: REMOTE_CONTROL heartbeat → device 0x%02X", device_id
+                    )
+                except Exception as exc:
+                    _LOGGER.warning("CAN BLE: REMOTE_CONTROL heartbeat failed: %s", exc)
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._rc_session_target == device_id:
+                self._rc_session_open = False
+                self._rc_session_target = None
 
     # ------------------------------------------------------------------
     # Step 1: UNLOCK_STATUS challenge → KEY response
@@ -2109,6 +3393,24 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._unknown_command_counts.clear()
         self._initial_get_devices_sent = False
         self._has_can_write = False
+        self._is_can_ble = False
+        self._can_device_types = {}
+        # Tear down any open REMOTE_CONTROL session — will be re-opened on next connect.
+        self._can_read_subscribed = False
+        self._can_local_host_claimed = False
+        self._can_local_host_identity_last_tx = 0.0
+        self._rc_session_open = False
+        self._rc_session_target = None
+        if self._rc_session_seed_future and not self._rc_session_seed_future.done():
+            self._rc_session_seed_future.cancel()
+        if self._rc_session_key_future and not self._rc_session_key_future.done():
+            self._rc_session_key_future.cancel()
+        if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
+            self._rc_heartbeat_task.cancel()
+        self._rc_heartbeat_task = None
+        if self._can_keepalive_task and not self._can_keepalive_task.done():
+            self._can_keepalive_task.cancel()
+        self._can_keepalive_task = None
         self._pin_dbus_succeeded = False
         self._push_button_dbus_ok = False
         # PIN agent context is cleaned up inside _finish_connect; if somehow
@@ -2180,9 +3482,19 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.address, generation, self._instance_tag,
             )
             await self.async_connect()
-            # Success — reset backoff counter
-            self._consecutive_failures = 0
-            _LOGGER.info("Reconnected to %s (instance=%s)", self.address, self._instance_tag)
+            # Reset backoff only when the connection is actually usable
+            # (authenticated, or bonded for PIN gateways).  If async_connect
+            # returned without raising but we're not authenticated, we consider
+            # it a partial failure and keep the backoff counter intact.
+            if self._authenticated or self._pin_dbus_succeeded:
+                self._consecutive_failures = 0
+                _LOGGER.info("Reconnected to %s (instance=%s)", self.address, self._instance_tag)
+            else:
+                _LOGGER.warning(
+                    "async_connect returned but %s is not authenticated — "
+                    "keeping backoff counter (%d)",
+                    self.address, self._consecutive_failures,
+                )
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -2202,7 +3514,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Called by the coordinator on its polling interval (if set)."""
-        if not self._connected:
+        # IDS-CAN BLE gateways manage reconnection via _schedule_reconnect;
+        # polling-based reconnects here would race with the backoff scheduler and cause
+        # spurious entity refreshes every 5s.  Skip the connect attempt for these devices.
+        if not self._can_ble_confirmed and not self._connected:
             try:
                 await self.async_connect()
             except BleakError as exc:

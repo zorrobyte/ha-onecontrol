@@ -132,7 +132,7 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_PAIRING_METHOD): vol.In(
                         {
                             PairingMethod.PUSH_BUTTON.value: "Push-to-Pair (has a physical Connect button)",
-                            PairingMethod.PIN.value: "PIN (legacy gateway, no Connect button)",
+                            PairingMethod.PIN.value: "PIN-based (no Connect button)",
                         }
                     )
                 }
@@ -173,7 +173,7 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         # Build the form — always ask for gateway PIN; show BT PIN field
-        # only for legacy PIN gateways.
+        # only for PIN-based gateways.
         fields: dict[Any, Any] = {
             vol.Required(CONF_GATEWAY_PIN, default=DEFAULT_GATEWAY_PIN): str,
         }

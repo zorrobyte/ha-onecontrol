@@ -23,10 +23,10 @@ MASK32 = 0xFFFFFFFF
 # ---------------------------------------------------------------------------
 # Obfuscated protocol constants — derived at module load time.
 # Each 4-byte big-endian word in _B is XOR'd with _M to recover the value.
-# Order: C1, C2, C3, C4, STEP1_CIPHER, STEP2_CIPHER
+# Order: C1, C2, C3, C4, STEP1_CIPHER, STEP2_CIPHER, RC_CYPHER
 # ---------------------------------------------------------------------------
 _M = 0xC7D2E1F0
-_B = _b64d(b"hL2RibW7hpiz8qi0lKGPk+NW0CVG0un9")
+_B = _b64d(b"hL2RibW7hpiz8qi0lKGPk+NW0CVG0un9drnhRQ==")
 
 
 def _u(o: int) -> int:
@@ -39,6 +39,12 @@ TEA_CONSTANT_3 = _u(8)
 TEA_CONSTANT_4 = _u(12)
 STEP1_CIPHER = _u(16)
 STEP2_CIPHER = _u(20)
+# IDS-CAN REMOTE_CONTROL session cipher (SESSION_ID value=4, Cypher from descriptors)
+RC_CYPHER = _u(24)
+
+# Official X180T/CAN-BLE gateway key/seed cipher.  Some IDS-CAN gateways do
+# this GATT key/seed unlock before the PASSWORD_UNLOCK/CAN service is usable.
+CAN_BLE_KEY_SEED_CIPHER = STEP1_CIPHER ^ 0xECA2B175
 
 del _u, _M, _B, _b64d  # Clean up namespace
 
@@ -85,6 +91,16 @@ def calculate_step1_key(challenge_bytes: bytes) -> bytes:
     seed = struct.unpack(">I", challenge_bytes)[0]  # BIG-ENDIAN
     encrypted = tea_encrypt(STEP1_CIPHER, seed)
     return struct.pack(">I", encrypted & MASK32)  # BIG-ENDIAN result
+
+
+def calculate_can_ble_key_seed_key(seed_bytes: bytes) -> bytes:
+    """Compute the 4-byte BIG-ENDIAN key for CAN-BLE gateway key/seed unlock."""
+    if len(seed_bytes) != 4:
+        raise ValueError(f"CAN-BLE key/seed challenge must be 4 bytes, got {len(seed_bytes)}")
+
+    seed = struct.unpack(">I", seed_bytes)[0]  # BIG-ENDIAN (official GetValueUInt32 default)
+    encrypted = tea_encrypt(CAN_BLE_KEY_SEED_CIPHER, seed)
+    return struct.pack(">I", encrypted & MASK32)
 
 
 # ── Step 2 ────────────────────────────────────────────────────────────────

@@ -19,7 +19,7 @@ This document describes the current HA-native implementation and excludes mobile
 - BLE discovery uses Lippert manufacturer advertisement data.
 - Config flow supports two pairing models:
   - push-to-pair gateways
-  - legacy PIN gateways
+  - PIN-based gateways
 - Core credentials:
   - `gateway_pin` (required)
   - `bluetooth_pin` (optional override)
@@ -184,7 +184,7 @@ Core operational timers:
 
 - cover behavior is conservative and state-oriented for movement safety
 - sensitive key-schedule values are not stored as plain constants
-- legacy PIN behavior depends on host BLE capabilities
+- PIN-based gateway behavior depends on host BLE capabilities
 
 ## 11. Evolution Notes (Commit History)
 
@@ -201,7 +201,7 @@ Recent trajectory includes:
 
 ## 12. Known Constraints
 
-- legacy PIN paths may be constrained by adapter/proxy stack behavior
+- PIN-based gateway paths may be constrained by adapter/proxy stack behavior
 - gateway firmware/protocol variance can require parser updates
 - friendly naming depends on successful metadata completion
 

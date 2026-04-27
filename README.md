@@ -27,7 +27,7 @@ During setup, the integration discovers OneControl gateways via BLE advertisemen
 | Gateway type | How to identify |
 | - | - |
 | **Push-to-Pair** | Has a physical "Connect" button on the RV control panel |
-| **PIN (legacy)** | No Connect button — uses only the 6-digit PIN sticker |
+| **PIN-based** | No Connect button — uses only the 6-digit PIN sticker |
 
 
 ### Push-to-Pair gateways (newer)
@@ -40,7 +40,7 @@ During setup, the integration discovers OneControl gateways via BLE advertisemen
 
 4. Works with both ESPHome Bluetooth Proxy and direct USB adapters
 
-### PIN (legacy) gateways (older)
+### PIN-based gateways
 
 1. Select **PIN** when prompted
 
@@ -52,7 +52,7 @@ During setup, the integration discovers OneControl gateways via BLE advertisemen
 
 ## PIN Gateway Requirements
 
-Legacy PIN gateways use a BLE passkey exchange during bonding that requires direct access to the host's BlueZ Bluetooth stack.
+PIN-based gateways can require a BLE passkey exchange during bonding that requires direct access to the host's BlueZ Bluetooth stack.
 
 ### Direct USB Bluetooth adapter (supported)
 

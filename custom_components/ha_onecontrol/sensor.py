@@ -173,6 +173,14 @@ class OneControlVoltageSensor(_OneControlSensorBase):
         self._attr_unique_id = f"{self._mac}_system_voltage"
 
     @property
+    def available(self) -> bool:
+        """Only available when MyRVLink RvStatus voltage is present."""
+        if self.coordinator.is_can_ble_gateway:
+            return False
+        data = self.coordinator.data
+        return super().available and bool(data and data.get("voltage") is not None)
+
+    @property
     def native_value(self) -> float | None:
         data = self.coordinator.data
         if data and "voltage" in data:
@@ -202,6 +210,8 @@ class OneControlTemperatureSensor(_OneControlSensorBase):
     @property
     def available(self) -> bool:
         """Only available when gateway actually reports a temperature."""
+        if self.coordinator.is_can_ble_gateway:
+            return False
         data = self.coordinator.data
         return super().available and bool(data and data.get("temperature") is not None)
 
@@ -234,7 +244,7 @@ class OneControlDeviceCountSensor(_OneControlSensorBase):
 
 
 class OneControlTableIdSensor(_OneControlSensorBase):
-    """Gateway CAN table ID."""
+    """MyRVLink gateway CAN table ID."""
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "Table ID"
@@ -245,7 +255,14 @@ class OneControlTableIdSensor(_OneControlSensorBase):
         self._attr_unique_id = f"{self._mac}_table_id"
 
     @property
+    def available(self) -> bool:
+        """IDS-CAN gateways do not expose a meaningful MyRVLink table ID."""
+        return super().available and not self.coordinator.is_can_ble_gateway
+
+    @property
     def native_value(self) -> int | None:
+        if self.coordinator.is_can_ble_gateway:
+            return None
         gi = self.coordinator.gateway_info
         return gi.table_id if gi else None
 

@@ -132,8 +132,9 @@ class OneControlInMotionLockout(
 ):
     """Binary sensor showing if the RV in-motion lockout is active.
 
-    When active (lockout_level > 0), the gateway prevents device control
-    because the vehicle is in motion.
+    MyRVLink gateways report this via DeviceLockStatus.  IDS-CAN BLE gateways
+    derive it from the NETWORK status bitfield.  In both cases, a non-zero
+    level means the RV reports an active in-motion lockout.
     """
 
     _attr_has_entity_name = True
@@ -156,7 +157,7 @@ class OneControlInMotionLockout(
 
     @property
     def available(self) -> bool:
-        """Only available once we've received at least one DeviceLockStatus."""
+        """Only available once we've received a MyRVLink or IDS-CAN lockout level."""
         return self.coordinator.system_lockout_level is not None
 
     @property
@@ -171,7 +172,10 @@ class OneControlInMotionLockout(
         level = self.coordinator.system_lockout_level
         if level is None:
             return {}
-        return {"lockout_level": level}
+        return {
+            "lockout_level": level,
+            "source": "ids_can_network" if self.coordinator.is_can_ble_gateway else "myrvlink_device_lock_status",
+        }
 
 
 class OneControlDataHealthy(
@@ -179,7 +183,9 @@ class OneControlDataHealthy(
 ):
     """Binary sensor showing if data is being received from the gateway.
 
-    Turns off if no events received for >15 seconds.
+    MyRVLink gateways require a live connection and turn off after 15 seconds
+    without data.  CAN BLE gateways can disconnect between broadcast cycles,
+    so this remains on for 30 seconds after the last IDS-CAN event.
     """
 
     _attr_has_entity_name = True
@@ -206,10 +212,22 @@ class OneControlDataHealthy(
 
     @property
     def extra_state_attributes(self) -> dict:
+        attrs: dict[str, Any] = {
+            "transport": "ids_can_ble" if self.coordinator.is_can_ble_gateway else "myrvlink_ble",
+            "raw_gateway_connected": self.coordinator.connected,
+            "raw_gateway_authenticated": self.coordinator.authenticated,
+        }
         age = self.coordinator.last_event_age
-        if age is None:
-            return {}
-        return {"last_event_age_seconds": round(age, 1)}
+        if age is not None:
+            attrs["last_event_age_seconds"] = round(age, 1)
+        if self.coordinator.is_can_ble_gateway:
+            attrs.update({
+                "can_read_subscribed": self.coordinator.can_read_subscribed,
+                "gateway_version": self.coordinator.can_ble_gateway_version,
+                "local_host_address": f"0x{self.coordinator.gateway_can_address:02X}",
+                "queued_can_commands": self.coordinator.can_command_queue_size,
+            })
+        return attrs
 
 
 class OneControlGeneratorQuietHours(

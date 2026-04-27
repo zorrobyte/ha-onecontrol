@@ -1,6 +1,6 @@
 """BlueZ D-Bus pairing agent for PIN-based OneControl gateways.
 
-PIN-based (legacy) gateways require a numeric passkey during BLE bonding.
+PIN-based gateways require a numeric passkey during BLE bonding.
 On HAOS (Linux/BlueZ), we register a temporary D-Bus ``org.bluez.Agent1``
 that provides the passkey when BlueZ requests it during ``Device1.Pair()``.
 
@@ -82,7 +82,7 @@ if _DBUS_AVAILABLE:
 
         @method()  # type: ignore[misc]
         def RequestPinCode(self, device: "o") -> "s":  # type: ignore[name-defined]  # noqa: N802, F821
-            """Legacy PIN code request (string)."""
+            """PIN code request (string)."""
             _LOGGER.info(
                 "PIN Agent: RequestPinCode for %s — providing %d-char string PIN "
                 "(BlueZ chose STRING pin path)",

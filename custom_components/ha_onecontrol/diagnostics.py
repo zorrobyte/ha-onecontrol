@@ -70,7 +70,35 @@ async def async_get_config_entry_diagnostics(
     # ── Lockout ──────────────────────────────────────────────────
     lockout = {
         "system_lockout_level": coordinator.system_lockout_level,
+        "source": (
+            "ids_can_network"
+            if coordinator.is_can_ble_gateway
+            else "myrvlink_device_lock_status"
+        ),
     }
+
+    # ── CAN BLE / IDS-CAN state ─────────────────────────────────
+    can_ble = {
+        "confirmed": coordinator.is_can_ble_gateway,
+    }
+    if coordinator.is_can_ble_gateway:
+        can_ble.update({
+            "gateway_version": coordinator.can_ble_gateway_version,
+            "can_read_subscribed": coordinator.can_read_subscribed,
+            "local_host_address": f"0x{coordinator.gateway_can_address:02X}",
+            "local_host_mac": coordinator.can_local_host_mac,
+            "discovered_device_types": {
+                f"0x{address:02X}": f"0x{device_type:02X}"
+                for address, device_type in sorted(coordinator.can_device_types.items())
+            },
+            "queued_can_commands": coordinator.can_command_queue_size,
+            "remote_control_session_open": coordinator.remote_control_session_open,
+            "remote_control_session_target": (
+                f"0x{coordinator.remote_control_session_target:02X}"
+                if coordinator.remote_control_session_target is not None
+                else None
+            ),
+        })
 
     # ── Relays (switches) ────────────────────────────────────────
     relays = {}
@@ -107,9 +135,9 @@ async def async_get_config_entry_diagnostics(
         hvacs[key] = {
             "heat_mode": zone.heat_mode,
             "fan_mode": zone.fan_mode,
-            "current_temp": zone.current_temp,
-            "low_trip": zone.low_trip,
-            "high_trip": zone.high_trip,
+            "current_temp": zone.indoor_temp_f,
+            "low_trip": zone.low_trip_f,
+            "high_trip": zone.high_trip_f,
             "name": coordinator.device_name(zone.table_id, zone.device_id),
         }
 
@@ -151,6 +179,7 @@ async def async_get_config_entry_diagnostics(
         "config_entry": async_redact_data(entry.as_dict(), TO_REDACT_CONFIG),
         "connection": connection,
         "gateway": gateway,
+        "can_ble": can_ble,
         "rv_status": rv_status,
         "lockout": lockout,
         "devices": {

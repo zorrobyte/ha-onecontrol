@@ -24,7 +24,7 @@
       },
       "confirm_pin": {
         "title": "Configure {name} (PIN Gateway)",
-        "description": "This is a legacy PIN-based gateway. Your gateway PIN is used for both Bluetooth bonding and protocol authentication.\n\n**Note:** PIN gateways work best with a direct USB Bluetooth adapter. ESPHome Bluetooth Proxy support is untested and may not work.",
+        "description": "This is a PIN-based OneControl gateway. Your gateway PIN is used for Bluetooth pairing and/or protocol authentication depending on gateway family.\n\n**Note:** PIN-based gateways work best with a direct USB Bluetooth adapter. ESPHome Bluetooth Proxy support is untested and may not work.",
         "data": {
           "gateway_pin": "Gateway PIN (from sticker)",
           "bluetooth_pin": "Bluetooth PIN override (leave blank to use Gateway PIN)"

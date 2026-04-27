@@ -132,9 +132,14 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
             attrs["dtc_fault"] = dtc_is_fault(relay.dtc_code)
         return attrs
 
+    def _guard_window(self) -> float:
+        """Optimistic guard duration — extended for CAN BLE gateways to survive reconnect cycle."""
+        return 20.0 if self.coordinator.is_can_ble_gateway else SWITCH_STATE_GUARD_S
+
     async def async_turn_on(self, **kwargs: Any) -> None:
+        _LOGGER.debug("Switch turn_on key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         self._optimistic_is_on = True
-        self._optimistic_until = time.monotonic() + SWITCH_STATE_GUARD_S
+        self._optimistic_until = time.monotonic() + self._guard_window()
         # Optimistic: update local state immediately for responsive UI
         relay = self.coordinator.relays.get(self._key)
         if relay:
@@ -148,8 +153,9 @@ class OneControlSwitch(CoordinatorEntity[OneControlCoordinator], SwitchEntity):
         await self.coordinator.async_switch(self._table_id, self._device_id, True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        _LOGGER.debug("Switch turn_off key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
         self._optimistic_is_on = False
-        self._optimistic_until = time.monotonic() + SWITCH_STATE_GUARD_S
+        self._optimistic_until = time.monotonic() + self._guard_window()
         relay = self.coordinator.relays.get(self._key)
         if relay:
             self.coordinator.relays[self._key] = RelayStatus(

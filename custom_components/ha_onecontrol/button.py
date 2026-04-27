@@ -1,7 +1,12 @@
 """Button platform for OneControl BLE integration.
 
-Creates button entities for:
-  - Clear In-Motion Lockout (sends 0x55 arm → 100ms → 0xAA clear)
+MyRVLink gateways expose buttons for:
+    - Clear In-Motion Lockout (sends 0x55 arm → 100ms → 0xAA clear)
+    - Refresh Metadata (re-requests MyRVLink device metadata tables)
+
+These are intentionally unavailable for IDS-CAN BLE gateways: metadata is
+learned from DEVICE_ID broadcasts, and the 0x55/0xAA clear sequence is a
+MyRVLink maintenance operation rather than a valid IDS-CAN command frame.
 
 Reference: INTERNALS.md § In-Motion Lockout, Android requestLockoutClear()
 """
@@ -67,7 +72,9 @@ class OneControlClearLockoutButton(
 
     @property
     def available(self) -> bool:
-        """Available when connected and lockout state is known."""
+        """Available on MyRVLink gateways when connected and lockout state is known."""
+        if self.coordinator.is_can_ble_gateway:
+            return False
         return (
             self.coordinator.connected
             and self.coordinator.system_lockout_level is not None
@@ -108,8 +115,12 @@ class OneControlRefreshMetadataButton(
 
     @property
     def available(self) -> bool:
-        """Available when connected and authenticated."""
-        return self.coordinator.connected and self.coordinator.authenticated
+        """Available on MyRVLink gateways when connected and authenticated."""
+        return (
+            not self.coordinator.is_can_ble_gateway
+            and self.coordinator.connected
+            and self.coordinator.authenticated
+        )
 
     async def async_press(self) -> None:
         """Re-request device metadata from the gateway."""
