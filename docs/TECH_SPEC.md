@@ -12,14 +12,17 @@ This document describes the current HA-native implementation and excludes mobile
 - **Primary runtime component:** `OneControlCoordinator`
 - **Platforms:** `binary_sensor`, `button`, `climate`, `light`, `sensor`, `switch`
 - **Transport:** BLE GATT via Home Assistant Bluetooth stack
+  - MyRvLink BLE data transport for original gateways
+  - IDS-CAN-over-BLE transport for CAN-BLE gateways such as Unity XZ and experimental Unity X180T
 - **Coordinator mode:** push/event-driven (`update_interval=None`)
 
 ## 3. Configuration and Entry Setup
 
-- BLE discovery uses Lippert manufacturer advertisement data.
+- BLE discovery uses Lippert manufacturer advertisement data, known service UUIDs, and the `LCIRemote` local-name prefix.
 - Config flow supports two pairing models:
   - push-to-pair gateways
   - PIN-based gateways
+- Experimental X180T discovery uses the official app's X180T primary service UUID and modern Lippert TLV advertisement metadata when available.
 - Core credentials:
   - `gateway_pin` (required)
   - `bluetooth_pin` (optional override)
@@ -36,7 +39,9 @@ This document describes the current HA-native implementation and excludes mobile
 
 ### 5.1 Authentication/session flow
 
-The coordinator executes a two-step authentication sequence before normal event handling.
+The coordinator supports multiple mutually exclusive BLE/authentication families. This reflects the official app architecture, where older MyRvLink gateways, legacy PIN gateways, IDS-CAN BLE gateways, and X180T-style pairable CAN gateways share some GATT services but use different security gates.
+
+For MyRvLink BLE gateways, the coordinator executes a two-step authentication sequence before normal event handling.
 
 - **Auth service:** `00000010-0200-a58e-e411-afe28044e62c`
 - **Seed characteristic:** `00000011-0200-a58e-e411-afe28044e62c`
@@ -45,6 +50,22 @@ The coordinator executes a two-step authentication sequence before normal event 
 - **Auth status characteristic:** `00000014-0200-a58e-e411-afe28044e62c`
 
 Session timing constants include `AUTH_TIMEOUT=10s`, `UNLOCK_VERIFY_DELAY=0.5s`, `NOTIFICATION_ENABLE_DELAY=0.2s`, and `BLE_MTU_SIZE=185`.
+
+IDS-CAN BLE gateways use a different runtime path:
+
+- **CAN service:** `00000000-0200-a58e-e411-afe28044e62c`
+- **CAN write characteristic:** `00000001-0200-a58e-e411-afe28044e62c`
+- **CAN read/notify characteristic:** `00000002-0200-a58e-e411-afe28044e62c`
+- **CAN software part/version characteristic:** `00000004-0200-a58e-e411-afe28044e62c`
+- **CAN password unlock characteristic:** `00000005-0200-a58e-e411-afe28044e62c`
+
+CAN-BLE gateways may also expose the key/seed service used by the official app before opening CAN traffic:
+
+- **Key/seed service:** `00000010-0200-a58e-e411-afe28044e62c`
+- **Seed/unlock status characteristic:** `00000012-0200-a58e-e411-afe28044e62c`
+- **Key characteristic:** `00000013-0200-a58e-e411-afe28044e62c`
+
+The official X180T/CAN-BLE key/seed cipher is `0xC81D7F20`. Unity XZ-style CAN-BLE gateways have been observed working without BLE SMP bonding, relying instead on GATT-level CAN-BLE authentication and IDS-CAN session behavior. X180T appears to be a hybrid: CAN-BLE runtime plus official-app BLE bonding and key/seed unlock.
 
 ### 5.2 Frame handling
 
@@ -63,6 +84,60 @@ MyRvLink event byte identifiers include (non-exhaustive):
 - `0x01` gateway info, `0x02` command response, `0x05/0x06` relay, `0x08` dimmable, `0x09` RGB,
 - `0x0B` HVAC, `0x0C/0x1B` tank, `0x0D/0x0E` h-bridge, `0x0F` hour meter, `0x20` RTC.
 
+IDS-CAN BLE transport uses CAN wire frames over `CAN_WRITE`/`CAN_READ`, not MyRvLink COBS data frames. V2 BLE CAN notifications are packed with a leading notification type byte:
+
+- `0x01` Packed device advertisement, expanded into synthetic NETWORK, DEVICE_ID, DEVICE_STATUS, and FakeCircuitID IDS-CAN frames
+- `0x02` ElevenBit, one reconstructed 11-bit IDS-CAN frame
+- `0x03` TwentyNineBit, one reconstructed 29-bit IDS-CAN frame
+
+The coordinator claims a LocalHost IDS-CAN source address, emits NETWORK identity frames, opens REMOTE_CONTROL sessions when needed, and queues CAN commands while the short-lived CAN-BLE connection is between reconnect windows.
+
+### 5.2.1 Lippert manufacturer advertisement parsing
+
+Older gateways can be interpreted using the first byte of Lippert manufacturer data as a legacy `PairingInfo` byte:
+
+- bit 0: push-to-pair button present on bus
+- bit 1: pairing currently enabled / Connect button active
+
+Modern IDS-CAN / X180T advertisements use the official app's TLV format instead. Home Assistant/Bleak exposes manufacturer data after the company identifier, so records are parsed as:
+
+`[length][type][payload...]`
+
+`length` includes the type byte, not the length byte.
+
+Known TLV types:
+
+| Type | Name | Payload |
+|------|------|---------|
+| `0` | `ConnectionInfo` | 2 bytes: status/capability, pairing flags |
+| `1` | `BleCanGatewayProtocolVersion` | 1 byte; values `>= 68` map to official gateway version `V2_D` |
+| `5` | `PairingInfo` | 1 byte; bit 0 indicates push-to-pair button present |
+
+`ConnectionInfo` status lower nibble maps to official BLE capability:
+
+| Value | Official capability | Integration pairing method |
+|-------|---------------------|----------------------------|
+| `0` | `DisplayOnly` | PIN/passkey |
+| `1` | `DisplayYesNo` | none |
+| `2` | `KeyboardOnly` | none |
+| `3` | `NoIO` | push-button / Just Works |
+| `4` | `KeyboardAndDisplay` | none |
+
+The pairing byte uses bit 0 for pairing supported and bit 1 for pairing available now. Button presence alone is not treated as the full pairing method; official behavior derives pairing method from `ConnectionInfo.BleCapability`.
+
+### 5.2.2 Unity X180T gateway model
+
+Experimental X180T support is based on official app handling rather than local hardware validation.
+
+- **X180T primary discovery service:** `0000000f-0200-a58e-e411-afe28044e62c`
+- Official scan result type implements pairable gateway, CAN gateway, manufacturer-data, and key/seed interfaces.
+- Runtime connection is `RvGatewayCanConnectionBle`, not MyRvLink.
+- Official app stores an empty CAN password for X180T (`string.Empty`) while still using BLE pairing metadata and key/seed exchange.
+- X180T uses CAN-BLE runtime service `00000000-0200-a58e-e411-afe28044e62c` after pairing/bonding.
+- X180T key/seed cipher is `0xC81D7F20`.
+
+The first experimental release classified X180T and routed it to CAN-BLE, but field logs showed that pre-connect BlueZ Just Works pairing could still fail before service discovery. The follow-up changed X180T push-button handling to more closely match official app ordering: register a Just Works agent, connect GATT first, then call `pair()` post-connect. If bonding or `CAN_READ` subscription fails, the coordinator now fails the attempt instead of marking the gateway authenticated and attempting CAN writes without service discovery.
+
 ### 5.3 Identity model
 
 - Canonical device join key: `(table_id, device_id)` encoded as `tt:dd`
@@ -71,6 +146,8 @@ MyRvLink event byte identifiers include (non-exhaustive):
 ### 5.4 BLE adapter source pinning
 
 The OneControl gateway requires BLE pairing (LTK/bond) to authenticate the UNLOCK_STATUS characteristic read (GATT ATT layer requires encryption). BlueZ stores LTK bonds **per physical adapter** under `/var/lib/bluetooth/<adapter_mac>/<device_mac>/`. ESPHome BT proxies maintain their own independent bond storage in device NVS flash — inaccessible to BlueZ. Consequently, routing a connection through a proxy that has never bonded to the gateway fails immediately with ATT error status=5 (Insufficient Authentication).
+
+This constraint applies to gateway families that require BLE SMP pairing/bonding. It does not necessarily apply to all CAN-BLE gateways. Unity XZ-style CAN-BLE operation has been observed working through an ESPHome BT proxy, which suggests that this gateway family can operate through ordinary proxied GATT reads/writes/notifications once the application-layer CAN-BLE unlock/session behavior succeeds. In practical terms: gateways requiring BLE SMP pairing need local BlueZ access; CAN-BLE gateways that only require GATT-level authentication may work through ESPHome proxies.
 
 HA's default adapter selection (`async_ble_device_from_address`) picks the "best" source from the scanner pool at connect time, which may resolve to whichever adapter has the strongest RSSI — often a nearby proxy at startup.
 
@@ -83,7 +160,7 @@ HA's default adapter selection (`async_ble_device_from_address`) picks the "best
 
 The `BluetoothScannerDevice` attributes used are `.ble_device` (`BLEDevice`) and `.scanner.source` (str — hciX MAC address for local adapters, proxy hostname for ESPHome proxies).
 
-**Fix (v1.0.19) — Boot connection via local HCI preferred:** The v1.0.16 fix stored the scanner source that produced the first successful auth. On HAOS, the local hci0 adapter is reported by HA's scanner pool with the same MAC that BlueZ advertises (e.g. `E0:D3:62:EA:52:52`), not a hostname. However, at cold boot `CONF_BONDED_SOURCE` may still hold a proxy source from a prior session, causing an immediate ATT INSUF_AUTH (error 19) before the fallback re-learns.
+**Fix (v1.0.19) — Boot connection via local HCI preferred:** The v1.0.16 fix stored the scanner source that produced the first successful auth. On HAOS, the local hci0 adapter is reported by HA's scanner pool with the same MAC that BlueZ advertises (for example, `<adapter_mac>`), not a hostname. However, at cold boot `CONF_BONDED_SOURCE` may still hold a proxy source from a prior session, causing an immediate ATT INSUF_AUTH (error 19) before the fallback re-learns.
 
 The v1.0.19 fix adds:
 - `async_get_local_adapter_macs()`: queries the BlueZ D-Bus `org.bluez.Adapter1` objects to enumerate all local HCI adapter MAC addresses.
@@ -185,6 +262,7 @@ Core operational timers:
 - cover behavior is conservative and state-oriented for movement safety
 - sensitive key-schedule values are not stored as plain constants
 - PIN-based gateway behavior depends on host BLE capabilities
+- gateway authentication is not a single mechanism across all models; BLE SMP bond, MyRvLink TEA unlock, CAN-BLE key/seed, and CAN password unlock may appear independently depending on controller family
 
 ## 11. Evolution Notes (Commit History)
 
@@ -198,10 +276,14 @@ Recent trajectory includes:
 - migration to `ha_onecontrol` domain naming
 - **v1.0.19 — Local HCI adapter preference at boot:** Added `async_get_local_adapter_macs()` (BlueZ D-Bus `org.bluez.Adapter1` enumeration) and `async_is_locally_bonded()` (BlueZ `Device1.Paired` check). At connect time the coordinator now strongly prefers a bonded local HCI adapter over any ESPHome proxy, eliminating the ATT INSUF_AUTH error that occurred at cold boot when `CONF_BONDED_SOURCE` held a stale proxy source. See §5.4 for design detail.
 - **v1.0.20 — RGB light fixes (issue #1):** Three bugs corrected: (1) `auto_off` command field defaulted to `0` (immediate auto-off) instead of `0xFF` (disabled) — lights turned on but the device extinguished them immediately; (2) the `0x09` status frame `AutoOff` byte (offset 4 of StatusBytes) was misread as brightness, causing HA to always report 0% brightness; (3) the `ATTR_BRIGHTNESS` kwarg was ignored on turn-on. Brightness is now derived as `max(R,G,B)` from the status frame and encoded by proportional R/G/B channel scaling on commands. See §5.5 for RGB protocol detail.
+- **v1.0.30 — IDS-CAN BLE / Unity XZ support:** Added CAN-BLE transport support using `CAN_WRITE`/`CAN_READ`, CAN software part/version decoding, CAN password unlock, key/seed unlock where present, LocalHost source claiming, V1/V2 CAN notification decoding, and REMOTE_CONTROL session handling. Unity XZ-style CAN-BLE has been observed working through ESPHome BT proxy because it appears to rely on GATT-level authentication rather than mandatory BLE SMP bonding.
+- **v1.0.31 — Experimental X180T support:** Added the official X180T primary service UUID, modern Lippert TLV manufacturer data parsing, official `ConnectionInfo` pairing-method mapping, X180T gateway-family config data, empty X180T CAN password handling, and X180T routing into CAN-BLE with key/seed cipher `0xC81D7F20`.
+- **v1.0.32 — X180T connect-first pairing follow-up:** Updated X180T push-button pairing order to register the Just Works agent, connect GATT first, then call `pair()` post-connect, matching the official app flow more closely. Also added stale-bond cleanup for X180T and prevented CAN-BLE auth from marking the gateway authenticated when service discovery or `CAN_READ` subscription has not completed.
 
 ## 12. Known Constraints
 
 - PIN-based gateway paths may be constrained by adapter/proxy stack behavior
+- X180T support remains experimental pending hardware validation; it combines BLE pairing/bonding, CAN-BLE runtime, and key/seed unlock in a hybrid model
 - gateway firmware/protocol variance can require parser updates
 - friendly naming depends on successful metadata completion
 
