@@ -19,6 +19,9 @@
       "service_uuid": "00000041-0200-a58e-e411-afe28044e62c"
     },
     {
+      "service_uuid": "0000000f-0200-a58e-e411-afe28044e62c"
+    },
+    {
       "local_name": "LCIRemote*"
     }
   ],
@@ -27,5 +30,5 @@
     "bleak>=0.21.0",
     "bleak-retry-connector>=3.1.0"
   ],
-  "version": "1.0.30"
+  "version": "1.0.31"
 }

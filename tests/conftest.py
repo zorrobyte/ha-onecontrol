@@ -30,6 +30,7 @@ _STUBS = [
     "homeassistant.helpers",
     "homeassistant.helpers.update_coordinator",
     "homeassistant.helpers.device_registry",
+    "homeassistant.helpers.entity_registry",
     "homeassistant.helpers.entity_platform",
     "homeassistant.components",
     "homeassistant.components.bluetooth",
@@ -37,6 +38,7 @@ _STUBS = [
     "voluptuous",
     "bleak",
     "bleak.exc",
+    "bleak_retry_connector",
 ]
 
 for _name in _STUBS:

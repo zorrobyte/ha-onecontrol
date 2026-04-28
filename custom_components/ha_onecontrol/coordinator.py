@@ -42,6 +42,7 @@ from .ble_agent import (
     remove_bond,
 )
 from .const import (
+    CONF_ADVERTISED_GATEWAY_VERSION,
     AUTH_SERVICE_UUID,
     BLE_MTU_SIZE,
     CAN_READ_CHAR_UUID,
@@ -50,6 +51,7 @@ from .const import (
     CONF_BLUETOOTH_PIN,
     PASSWORD_UNLOCK_CHAR_UUID,
     CONF_BONDED_SOURCE,
+    CONF_GATEWAY_FAMILY,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
     DATA_READ_CHAR_UUID,
@@ -57,6 +59,8 @@ from .const import (
     DATA_WRITE_CHAR_UUID,
     DEFAULT_GATEWAY_PIN,
     DOMAIN,
+    GATEWAY_FAMILY_LEGACY,
+    GATEWAY_FAMILY_X180T,
     HEARTBEAT_INTERVAL,
     HVAC_CAP_AC,
     HVAC_CAP_GAS,
@@ -296,6 +300,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── PIN-based pairing (MyRVLink PIN gateways) ─────────────────
         self._pairing_method: str = entry.data.get(CONF_PAIRING_METHOD, "push_button")
+        self._gateway_family: str = entry.data.get(
+            CONF_GATEWAY_FAMILY, GATEWAY_FAMILY_LEGACY
+        )
         self._instance_tag: str = f"{id(self):x}"[-6:]
         # Android uses gateway_pin for both BLE bonding AND protocol auth.
         # bluetooth_pin is an optional override if the BLE PIN differs.
@@ -390,7 +397,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._can_local_host_claimed: bool = False
         self._can_local_host_mac: bytes = self._make_can_local_host_mac()
         self._can_local_host_identity_last_tx: float = 0.0
-        self._can_ble_gateway_version: str = "Unknown"
+        self._can_ble_gateway_version: str = entry.data.get(
+            CONF_ADVERTISED_GATEWAY_VERSION, "Unknown"
+        )
         # CAN-only link keepalive task. Periodic lightweight discovery requests
         # keep the gateway link active during idle periods.
         self._can_keepalive_task: asyncio.Task | None = None
@@ -1265,6 +1274,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """True if this gateway uses PIN-based BLE pairing."""
         return self._pairing_method == "pin"
 
+    @property
+    def is_x180t_gateway(self) -> bool:
+        """True for Unity X180T CAN-BLE gateways."""
+        return self._gateway_family == GATEWAY_FAMILY_X180T
+
     async def _try_connect(self, attempt: int) -> None:
         """Single connection attempt — connect, pair, authenticate."""
         _LOGGER.info(
@@ -1490,6 +1504,27 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.address, adapter, getattr(ble_device, "rssi", "?"),
         )
 
+        self._push_button_dbus_ok = False
+        if self.is_pin_gateway:
+            ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
+            self._pin_agent_ctx = ctx
+            if ctx and ctx.already_bonded:
+                self._pin_dbus_succeeded = True
+                self._pin_already_bonded = True
+                _LOGGER.info(
+                    "PIN gateway %s — already bonded on %s, connecting directly",
+                    self.address, adapter,
+                )
+        elif is_pin_pairing_supported():
+            _LOGGER.info(
+                "PushButton gateway — attempting D-Bus Just Works pairing "
+                "with %s before direct connect",
+                self.address,
+            )
+            dbus_ok = await pair_push_button(self.address, timeout=30.0)
+            if dbus_ok:
+                self._push_button_dbus_ok = True
+
         client = await establish_connection(
             BleakClient,
             ble_device,
@@ -1538,18 +1573,44 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except Exception as exc:
                     _LOGGER.warning("pair() failed: %s — continuing", exc)
         else:
-            # PIN gateways: skip BLE SMP pair() entirely.
-            # These gateways authenticate at the GATT application layer via
-            # TEA key exchange (UNLOCK_STATUS/KEY characteristics). Calling
-            # pair() causes an immediate AuthenticationFailed — the device
-            # does not use SMP bonding at all.
-            if self._pin_agent_ctx:
-                await self._pin_agent_ctx.cleanup()
-                self._pin_agent_ctx = None
-            _LOGGER.info(
-                "PIN gateway %s — skipping BLE pair(), authenticating via GATT TEA",
-                self.address,
-            )
+            if self.is_x180t_gateway:
+                # Official X180T flow bonds first, then performs key/seed
+                # unlock.  The PIN agent is already registered so BlueZ can
+                # answer DisplayOnly/passkey requests during pair().
+                try:
+                    if self._pin_already_bonded:
+                        _LOGGER.info(
+                            "X180T PIN gateway %s — already bonded, skipping pair()",
+                            self.address,
+                        )
+                    elif hasattr(client, "pair"):
+                        _LOGGER.info("X180T PIN gateway %s — requesting BLE bond", self.address)
+                        paired = await client.pair()
+                        self._pin_dbus_succeeded = bool(paired)
+                        _LOGGER.info("X180T BLE pair() result: %s", paired)
+                    else:
+                        _LOGGER.debug("pair() not available on client wrapper")
+                except NotImplementedError:
+                    _LOGGER.info("pair() not implemented — may already be bonded")
+                except Exception as exc:
+                    _LOGGER.warning("X180T BLE pair() failed: %s — continuing", exc)
+                finally:
+                    if self._pin_agent_ctx:
+                        await self._pin_agent_ctx.cleanup()
+                        self._pin_agent_ctx = None
+            else:
+                # Legacy PIN gateways: skip BLE SMP pair() entirely.
+                # These gateways authenticate at the GATT application layer via
+                # TEA key exchange (UNLOCK_STATUS/KEY characteristics). Calling
+                # pair() causes an immediate AuthenticationFailed — the device
+                # does not use SMP bonding at all.
+                if self._pin_agent_ctx:
+                    await self._pin_agent_ctx.cleanup()
+                    self._pin_agent_ctx = None
+                _LOGGER.info(
+                    "PIN gateway %s — skipping BLE pair(), authenticating via GATT TEA",
+                    self.address,
+                )
 
         await asyncio.sleep(0.5)
 
@@ -1568,16 +1629,22 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             _LOGGER.info("CAN_WRITE characteristic available")
                         if char.uuid == UNLOCK_STATUS_CHAR_UUID:
                             _has_unlock_status = True
-                # CAN-only gateways expose CAN service but no MyRvLink AUTH service
-                if self._has_can_write and not _has_unlock_status:
+                # CAN-only gateways expose CAN service but no MyRvLink AUTH service.
+                # X180T exposes the key/seed auth service as well, but official
+                # app still routes it through the CAN-BLE adapter.
+                if self._has_can_write and (not _has_unlock_status or self.is_x180t_gateway):
                     self._is_can_ble = True
                     _LOGGER.info(
-                        "CAN-only gateway detected (no UNLOCK_STATUS) — will use IDS-CAN BLE path"
+                        "CAN BLE gateway detected%s — will use IDS-CAN BLE path",
+                        " (X180T)" if self.is_x180t_gateway else " (no UNLOCK_STATUS)",
                     )
             else:
                 _LOGGER.warning("No GATT services discovered")
         except Exception as exc:
             _LOGGER.warning("Failed to enumerate services: %s", exc)
+
+        if self.is_x180t_gateway:
+            self._is_can_ble = True
 
         if self._is_can_ble:
             # ── CAN-only path ──────────────────────────────────────────
@@ -1686,8 +1753,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "CAN BLE: PASSWORD_UNLOCK read = %s (locked=%s)", lock_data.hex(), locked
             )
             if locked:
-                pin_bytes = self.gateway_pin.encode("utf-8")
-                _LOGGER.info("CAN BLE: writing gateway PIN to PASSWORD_UNLOCK")
+                pin_bytes = b"" if self.is_x180t_gateway else self.gateway_pin.encode("utf-8")
+                _LOGGER.info(
+                    "CAN BLE: writing %s to PASSWORD_UNLOCK",
+                    "empty X180T CAN password" if self.is_x180t_gateway else "gateway PIN",
+                )
                 await client.write_gatt_char(
                     PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=True
                 )

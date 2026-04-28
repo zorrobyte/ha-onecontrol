@@ -39,8 +39,10 @@ async def async_get_config_entry_diagnostics(
             else None
         ),
         "pairing_method": coordinator._pairing_method,
+        "gateway_family": coordinator._gateway_family,
         "is_pin_gateway": coordinator.is_pin_gateway,
-        "pin_bond_attempted": coordinator._pin_bond_attempted,
+        "is_x180t_gateway": coordinator.is_x180t_gateway,
+        "pin_bond_attempted": getattr(coordinator, "_pin_bond_attempted", None),
         "has_can_write": coordinator._has_can_write,
         "consecutive_reconnect_failures": coordinator._consecutive_failures,
         "pending_metadata_cmdids": len(coordinator._pending_metadata_cmdids),

@@ -23,6 +23,8 @@ CAN_READ_CHAR_UUID = f"00000002{UUID_BASE}"
 CAN_VERSION_CHAR_UUID = f"00000004{UUID_BASE}"
 PASSWORD_UNLOCK_CHAR_UUID = f"00000005{UUID_BASE}"
 
+X180T_DISCOVERY_SERVICE_UUID = f"0000000f{UUID_BASE}"
+
 DISCOVERY_SERVICE_UUID = f"00000041{UUID_BASE}"
 
 # ---------------------------------------------------------------------------
@@ -155,3 +157,8 @@ CONF_GATEWAY_PIN = "gateway_pin"
 CONF_BLUETOOTH_PIN = "bluetooth_pin"
 CONF_PAIRING_METHOD = "pairing_method"
 CONF_BONDED_SOURCE = "bonded_source"
+CONF_GATEWAY_FAMILY = "gateway_family"
+CONF_ADVERTISED_GATEWAY_VERSION = "advertised_gateway_version"
+
+GATEWAY_FAMILY_LEGACY = "legacy"
+GATEWAY_FAMILY_X180T = "x180t_can_ble"
