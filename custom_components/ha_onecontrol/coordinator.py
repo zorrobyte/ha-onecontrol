@@ -39,6 +39,7 @@ from .ble_agent import (
     is_pin_pairing_supported,
     pair_push_button,
     prepare_pin_agent,
+    prepare_push_button_agent,
     remove_bond,
 )
 from .const import (
@@ -1202,10 +1203,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # _pin_already_bonded is a sticky flag — unlike _pin_dbus_succeeded it is
         # NOT cleared by _on_disconnect, so it survives across the retry loop.
         # We remove the stale bond and attempt one fresh PIN pairing.
-        if self.is_pin_gateway and self._pin_already_bonded:
+        if (self.is_pin_gateway or self.is_x180t_gateway) and self._pin_already_bonded:
             _LOGGER.warning(
-                "PIN gateway %s: BlueZ bond present but all connection attempts failed "
-                "— removing stale bond and retrying with fresh PIN pairing",
+                "%s gateway %s: BlueZ bond present but all connection attempts failed "
+                "— removing stale bond and retrying with fresh pairing",
+                "X180T" if self.is_x180t_gateway else "PIN",
                 self.address,
             )
             removed = await remove_bond(self.address)
@@ -1428,6 +1430,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "PIN gateway %s — already bonded, connecting directly",
                     self.address,
                 )
+        elif self.is_x180t_gateway:
+            # Official X180T flow connects first, then creates the bond.  Keep
+            # a Just Works agent registered for the upcoming post-connect pair().
+            ctx = await prepare_push_button_agent(self.address)
+            self._pin_agent_ctx = ctx
+            if ctx and ctx.already_bonded:
+                self._push_button_dbus_ok = True
+                self._pin_already_bonded = True
+                _LOGGER.info(
+                    "X180T gateway %s — already bonded, connecting directly",
+                    self.address,
+                )
         elif is_pin_pairing_supported():
             _LOGGER.info(
                 "PushButton gateway — attempting D-Bus Just Works pairing "
@@ -1515,6 +1529,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "PIN gateway %s — already bonded on %s, connecting directly",
                     self.address, adapter,
                 )
+        elif self.is_x180t_gateway:
+            ctx = await prepare_push_button_agent(self.address)
+            self._pin_agent_ctx = ctx
+            if ctx and ctx.already_bonded:
+                self._push_button_dbus_ok = True
+                self._pin_already_bonded = True
+                _LOGGER.info(
+                    "X180T gateway %s — already bonded on %s, connecting directly",
+                    self.address, adapter,
+                )
         elif is_pin_pairing_supported():
             _LOGGER.info(
                 "PushButton gateway — attempting D-Bus Just Works pairing "
@@ -1562,16 +1586,31 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             else:
                 try:
-                    _LOGGER.debug("Requesting BLE pair (PushButton) with %s", self.address)
+                    if self.is_x180t_gateway:
+                        _LOGGER.info(
+                            "X180T PushButton gateway %s — requesting post-connect BLE bond",
+                            self.address,
+                        )
+                    else:
+                        _LOGGER.debug("Requesting BLE pair (PushButton) with %s", self.address)
                     if hasattr(client, "pair"):
                         paired = await client.pair()
                         _LOGGER.info("BLE pair() result: %s", paired)
+                        if self.is_x180t_gateway and not paired:
+                            raise BleakError("X180T BLE bonding returned False")
                     else:
                         _LOGGER.debug("pair() not available on client wrapper")
                 except NotImplementedError:
                     _LOGGER.info("pair() not implemented — may already be bonded")
                 except Exception as exc:
+                    if self.is_x180t_gateway:
+                        _LOGGER.warning("X180T BLE pair() failed: %s", exc)
+                        raise BleakError("X180T BLE bonding failed") from exc
                     _LOGGER.warning("pair() failed: %s — continuing", exc)
+                finally:
+                    if self.is_x180t_gateway and self._pin_agent_ctx:
+                        await self._pin_agent_ctx.cleanup()
+                        self._pin_agent_ctx = None
         else:
             if self.is_x180t_gateway:
                 # Official X180T flow bonds first, then performs key/seed
@@ -1588,12 +1627,15 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         paired = await client.pair()
                         self._pin_dbus_succeeded = bool(paired)
                         _LOGGER.info("X180T BLE pair() result: %s", paired)
+                        if not paired:
+                            raise BleakError("X180T BLE PIN bonding returned False")
                     else:
                         _LOGGER.debug("pair() not available on client wrapper")
                 except NotImplementedError:
                     _LOGGER.info("pair() not implemented — may already be bonded")
                 except Exception as exc:
-                    _LOGGER.warning("X180T BLE pair() failed: %s — continuing", exc)
+                    _LOGGER.warning("X180T BLE pair() failed: %s", exc)
+                    raise BleakError("X180T BLE PIN bonding failed") from exc
                 finally:
                     if self._pin_agent_ctx:
                         await self._pin_agent_ctx.cleanup()
@@ -1800,6 +1842,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.info("CAN BLE: subscribed to CAN_READ (%s)", CAN_READ_CHAR_UUID)
         except BleakError as exc:
             _LOGGER.warning("CAN BLE: could not subscribe CAN_READ: %s", exc)
+            self._can_read_subscribed = False
+            raise BleakError("CAN BLE authentication failed before CAN_READ subscribe") from exc
 
         self._authenticated = True
         self._can_ble_confirmed = True

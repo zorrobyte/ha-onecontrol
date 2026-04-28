@@ -352,6 +352,63 @@ async def prepare_pin_agent(
         return None
 
 
+async def prepare_push_button_agent(device_address: str) -> PinAgentContext | None:
+    """Register a Just Works agent WITHOUT calling Device1.Pair().
+
+    X180T gateways follow the official app's connect-first flow: connect GATT,
+    then create the bond.  This helper leaves a NoInputNoOutput agent active so
+    BlueZ can accept the post-connect ``client.pair()`` callbacks.
+    """
+    if not _DBUS_AVAILABLE:
+        return None
+
+    from dbus_fast import BusType  # noqa: F811
+    from dbus_fast.aio import MessageBus  # noqa: F811
+
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except Exception as exc:
+        _LOGGER.error("Cannot connect to system D-Bus: %s", exc)
+        return None
+
+    try:
+        device_path = await _find_device_path(bus, device_address)
+        if device_path and await _is_paired(bus, device_path):
+            _LOGGER.info(
+                "Device %s already bonded in BlueZ — Just Works agent not needed",
+                device_address,
+            )
+            return PinAgentContext(bus=bus, agent_registered=False, already_bonded=True)
+
+        agent = _PinAgentInterface(0, "")
+        bus.export(AGENT_PATH, agent)
+
+        agent_registered = await _register_agent_no_input(bus)
+        if not agent_registered:
+            _LOGGER.error("Failed to register Just Works agent with BlueZ")
+            bus.disconnect()
+            return None
+
+        _LOGGER.info(
+            "Just Works agent registered for %s — connect GATT then call pair()",
+            device_address,
+        )
+        return PinAgentContext(
+            bus=bus,
+            agent_registered=True,
+            already_bonded=False,
+            agent=agent,
+        )
+
+    except Exception as exc:
+        _LOGGER.error("prepare_push_button_agent failed for %s: %s", device_address, exc)
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+        return None
+
+
 async def pair_with_pin(
     device_address: str,
     pin: str,
