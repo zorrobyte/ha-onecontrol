@@ -32,7 +32,7 @@
       },
       "confirm_x180t": {
         "title": "Configure {name} (Unity X180T Gateway)",
-        "description": "This gateway matches the official Unity X180T CAN-BLE profile. If prompted, enter the 6-digit Bluetooth PIN from the gateway label. The CAN connection itself uses the official app's empty X180T password handling.",
+        "description": "This gateway matches the official Unity X180T CAN-BLE profile. If your gateway label or control panel shows a 6-digit Bluetooth PIN, enter it here. The CAN connection itself uses the official app's empty X180T password handling.",
         "data": {
           "bluetooth_pin": "Bluetooth PIN from gateway label"
         }

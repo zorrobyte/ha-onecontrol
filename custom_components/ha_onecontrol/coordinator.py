@@ -1239,7 +1239,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             hci_adapters = sorted(
                 name
-                for name in os.listdir("/sys/class/bluetooth")
+                for name in await asyncio.to_thread(os.listdir, "/sys/class/bluetooth")
                 if name.startswith("hci")
             )
         except OSError:
@@ -1432,8 +1432,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
         elif self.is_x180t_gateway:
             # Official X180T flow connects first, then creates the bond.  Keep
-            # a Just Works agent registered for the upcoming post-connect pair().
-            ctx = await prepare_push_button_agent(self.address)
+            # an agent registered for the upcoming post-connect pair(). Some
+            # X180T panels have both a Connect button and a 6-digit BLE PIN.
+            if self._bluetooth_pin:
+                ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
+            else:
+                ctx = await prepare_push_button_agent(self.address)
             self._pin_agent_ctx = ctx
             if ctx and ctx.already_bonded:
                 self._push_button_dbus_ok = True
@@ -1530,7 +1534,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.address, adapter,
                 )
         elif self.is_x180t_gateway:
-            ctx = await prepare_push_button_agent(self.address)
+            if self._bluetooth_pin:
+                ctx = await prepare_pin_agent(self.address, self._bluetooth_pin)
+            else:
+                ctx = await prepare_push_button_agent(self.address)
             self._pin_agent_ctx = ctx
             if ctx and ctx.already_bonded:
                 self._push_button_dbus_ok = True
@@ -1587,10 +1594,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 try:
                     if self.is_x180t_gateway:
-                        _LOGGER.info(
-                            "X180T PushButton gateway %s — requesting post-connect BLE bond",
-                            self.address,
-                        )
+                        if self._bluetooth_pin:
+                            _LOGGER.info(
+                                "X180T PushButton gateway %s — requesting post-connect BLE bond with PIN agent",
+                                self.address,
+                            )
+                        else:
+                            _LOGGER.info(
+                                "X180T PushButton gateway %s — requesting post-connect BLE bond",
+                                self.address,
+                            )
                     else:
                         _LOGGER.debug("Requesting BLE pair (PushButton) with %s", self.address)
                     if hasattr(client, "pair"):
