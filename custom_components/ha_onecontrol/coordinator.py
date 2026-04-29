@@ -1610,6 +1610,23 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         paired = await client.pair()
                         _LOGGER.info("BLE pair() result: %s", paired)
                         if self.is_x180t_gateway and not paired:
+                            if await async_is_locally_bonded(self.address):
+                                _LOGGER.info(
+                                    "X180T BLE pair() returned %s but BlueZ reports bonded",
+                                    paired,
+                                )
+                                self._push_button_dbus_ok = True
+                                self._pin_already_bonded = True
+                            else:
+                                raise BleakError("X180T BLE bonding returned False")
+                    elif self.is_x180t_gateway:
+                        if await async_is_locally_bonded(self.address):
+                            _LOGGER.info(
+                                "X180T pair() unavailable but BlueZ reports bonded"
+                            )
+                            self._push_button_dbus_ok = True
+                            self._pin_already_bonded = True
+                        else:
                             raise BleakError("X180T BLE bonding returned False")
                     else:
                         _LOGGER.debug("pair() not available on client wrapper")
@@ -1814,7 +1831,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "empty X180T CAN password" if self.is_x180t_gateway else "gateway PIN",
                 )
                 await client.write_gatt_char(
-                    PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=True
+                    PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=False
                 )
                 await asyncio.sleep(1.0)
                 verify = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
