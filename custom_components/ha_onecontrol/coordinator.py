@@ -1893,6 +1893,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Small gap so GATT notifications settle before writing
         await asyncio.sleep(0.2)
 
+        if self.is_x180t_gateway:
+            quiet_seconds = 20.0
+            _LOGGER.info(
+                "CAN BLE: X180T experiment — quiet mode enabled for %.1fs (listen-only, delaying outbound LocalHost/discovery traffic)",
+                quiet_seconds,
+            )
+            if self._can_keepalive_task and not self._can_keepalive_task.done():
+                self._can_keepalive_task.cancel()
+            self._can_keepalive_task = self.hass.async_create_background_task(
+                self._can_start_runtime_traffic_after_quiet_period(client, quiet_seconds),
+                name="ha_onecontrol_can_quiet_start",
+            )
+            return
+
         # Official IDS-CAN adapters enable a LocalHost, wait for the bus to settle,
         # claim an unused source address with a NETWORK broadcast, then use that
         # claimed address for session and command traffic.  Without this, devices
@@ -1909,6 +1923,32 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._can_keepalive_task = self.hass.async_create_background_task(
             self._can_keepalive_loop(client), name="ha_onecontrol_can_keepalive"
         )
+
+    async def _can_start_runtime_traffic_after_quiet_period(
+        self, client: BleakClient, quiet_seconds: float
+    ) -> None:
+        """Delay post-auth CAN traffic for X180T experiment to test link stability."""
+        try:
+            await asyncio.sleep(quiet_seconds)
+            if not (
+                self._connected
+                and self._authenticated
+                and self._can_read_subscribed
+                and self._client is client
+            ):
+                return
+
+            _LOGGER.info(
+                "CAN BLE: X180T experiment — quiet mode complete; enabling LocalHost claim/discovery/keepalive"
+            )
+            await self._claim_can_local_host_address(client)
+            await self._flush_can_commands(client)
+            await self._send_can_device_discovery(client)
+            await self._can_keepalive_loop(client)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("CAN BLE: quiet-start task ended due to error: %s", exc)
 
     def _on_can_read(
         self, characteristic: BleakGATTCharacteristic, data: bytearray
