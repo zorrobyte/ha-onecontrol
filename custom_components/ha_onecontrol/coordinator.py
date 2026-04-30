@@ -1772,6 +1772,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
               no devices are known yet.
         """
         _LOGGER.info("CAN BLE gateway %s — starting IDS-CAN authentication", self.address)
+        keyseed_verified = False
 
         # --- Official CAN-BLE key/seed unlock ---
         # BleManager performs this before BleCommunicationsAdapter opens the CAN
@@ -1781,6 +1782,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             seed_data = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
             if seed_data.lower() == b"unlocked":
                 _LOGGER.info("CAN BLE: key/seed unlock already verified")
+                keyseed_verified = True
             elif len(seed_data) >= 4:
                 seed = bytes(seed_data[:4])
                 key = calculate_can_ble_key_seed_key(seed)
@@ -1789,6 +1791,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await asyncio.sleep(0.5)
                 verify = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
                 _LOGGER.info("CAN BLE: key/seed unlock verify=%s", verify.hex())
+                if verify == b"\x00\x00\x00\x00" or verify.lower() == b"unlocked":
+                    keyseed_verified = True
             else:
                 _LOGGER.debug("CAN BLE: key/seed unlock seed unavailable: %s", seed_data.hex())
         except BleakError as exc:
@@ -1825,23 +1829,28 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "CAN BLE: PASSWORD_UNLOCK read = %s (locked=%s)", lock_data.hex(), locked
             )
             if locked:
-                pin_bytes = b"" if self.is_x180t_gateway else self.gateway_pin.encode("utf-8")
-                _LOGGER.info(
-                    "CAN BLE: writing %s to PASSWORD_UNLOCK",
-                    "empty X180T CAN password" if self.is_x180t_gateway else "gateway PIN",
-                )
-                await client.write_gatt_char(
-                    PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=False
-                )
-                await asyncio.sleep(1.0)
-                verify = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
-                if len(verify) == 0 or verify[0] == 0x00:
-                    _LOGGER.error(
-                        "CAN BLE: PIN unlock failed — verify=%s", verify.hex()
+                if self.is_x180t_gateway and keyseed_verified:
+                    _LOGGER.info(
+                        "CAN BLE: X180T experiment — skipping PASSWORD_UNLOCK write after key/seed verify"
                     )
-                    # Don't abort — proceed anyway; the gateway may still accept commands
                 else:
-                    _LOGGER.info("CAN BLE: PIN unlock verified = %s", verify.hex())
+                    pin_bytes = b"" if self.is_x180t_gateway else self.gateway_pin.encode("utf-8")
+                    _LOGGER.info(
+                        "CAN BLE: writing %s to PASSWORD_UNLOCK",
+                        "empty X180T CAN password" if self.is_x180t_gateway else "gateway PIN",
+                    )
+                    await client.write_gatt_char(
+                        PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=False
+                    )
+                    await asyncio.sleep(1.0)
+                    verify = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
+                    if len(verify) == 0 or verify[0] == 0x00:
+                        _LOGGER.error(
+                            "CAN BLE: PIN unlock failed — verify=%s", verify.hex()
+                        )
+                        # Don't abort — proceed anyway; the gateway may still accept commands
+                    else:
+                        _LOGGER.info("CAN BLE: PIN unlock verified = %s", verify.hex())
         except BleakError as exc:
             _LOGGER.warning(
                 "CAN BLE: PASSWORD_UNLOCK char not accessible (%s) — proceeding", exc
