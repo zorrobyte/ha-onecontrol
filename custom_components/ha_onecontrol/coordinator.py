@@ -1772,7 +1772,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
               no devices are known yet.
         """
         _LOGGER.info("CAN BLE gateway %s — starting IDS-CAN authentication", self.address)
-        keyseed_verified = False
 
         # --- Official CAN-BLE key/seed unlock ---
         # BleManager performs this before BleCommunicationsAdapter opens the CAN
@@ -1782,7 +1781,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             seed_data = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
             if seed_data.lower() == b"unlocked":
                 _LOGGER.info("CAN BLE: key/seed unlock already verified")
-                keyseed_verified = True
             elif len(seed_data) >= 4:
                 seed = bytes(seed_data[:4])
                 key = calculate_can_ble_key_seed_key(seed)
@@ -1791,8 +1789,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await asyncio.sleep(0.5)
                 verify = await client.read_gatt_char(UNLOCK_STATUS_CHAR_UUID)
                 _LOGGER.info("CAN BLE: key/seed unlock verify=%s", verify.hex())
-                if verify == b"\x00\x00\x00\x00" or verify.lower() == b"unlocked":
-                    keyseed_verified = True
             else:
                 _LOGGER.debug("CAN BLE: key/seed unlock seed unavailable: %s", seed_data.hex())
         except BleakError as exc:
@@ -1829,29 +1825,41 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "CAN BLE: PASSWORD_UNLOCK read = %s (locked=%s)", lock_data.hex(), locked
             )
             if locked:
-                if self.is_x180t_gateway and keyseed_verified:
-                    _LOGGER.info(
-                        "CAN BLE: X180T experiment — skipping PASSWORD_UNLOCK write after key/seed verify"
-                    )
-                else:
-                    pin_bytes = b"" if self.is_x180t_gateway else self.gateway_pin.encode("utf-8")
-                    _LOGGER.info(
-                        "CAN BLE: writing %s to PASSWORD_UNLOCK",
-                        "empty X180T CAN password" if self.is_x180t_gateway else "gateway PIN",
-                    )
+                pin_bytes = b"" if self.is_x180t_gateway else self.gateway_pin.encode("utf-8")
+                _LOGGER.info(
+                    "CAN BLE: writing %s to PASSWORD_UNLOCK",
+                    "empty X180T CAN password" if self.is_x180t_gateway else "gateway PIN",
+                )
+
+                unlock_ok = False
+                verify = b""
+                for attempt in range(2):
                     await client.write_gatt_char(
                         PASSWORD_UNLOCK_CHAR_UUID, pin_bytes, response=False
                     )
                     await asyncio.sleep(1.0)
                     verify = await client.read_gatt_char(PASSWORD_UNLOCK_CHAR_UUID)
-                    if len(verify) == 0 or verify[0] == 0x00:
-                        _LOGGER.error(
-                            "CAN BLE: PIN unlock failed — verify=%s", verify.hex()
+                    if len(verify) > 0 and verify[0] != 0x00:
+                        unlock_ok = True
+                        break
+                    if attempt == 0:
+                        _LOGGER.warning(
+                            "CAN BLE: PIN unlock verify still locked (%s), retrying write",
+                            verify.hex(),
                         )
-                        # Don't abort — proceed anyway; the gateway may still accept commands
-                    else:
-                        _LOGGER.info("CAN BLE: PIN unlock verified = %s", verify.hex())
+
+                if unlock_ok:
+                    _LOGGER.info(
+                        "CAN BLE: PIN unlock verified = %s", verify.hex()
+                    )
+                else:
+                    raise BleakError(
+                        f"CAN BLE unlock failed — verify={verify.hex() or 'empty'}"
+                    )
         except BleakError as exc:
+            if self.is_x180t_gateway:
+                _LOGGER.warning("CAN BLE: X180T unlock failed (%s)", exc)
+                raise BleakError("X180T CAN BLE unlock failed") from exc
             _LOGGER.warning(
                 "CAN BLE: PASSWORD_UNLOCK char not accessible (%s) — proceeding", exc
             )
@@ -1893,20 +1901,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Small gap so GATT notifications settle before writing
         await asyncio.sleep(0.2)
 
-        if self.is_x180t_gateway:
-            quiet_seconds = 20.0
-            _LOGGER.info(
-                "CAN BLE: X180T experiment — quiet mode enabled for %.1fs (listen-only, delaying outbound LocalHost/discovery traffic)",
-                quiet_seconds,
-            )
-            if self._can_keepalive_task and not self._can_keepalive_task.done():
-                self._can_keepalive_task.cancel()
-            self._can_keepalive_task = self.hass.async_create_background_task(
-                self._can_start_runtime_traffic_after_quiet_period(client, quiet_seconds),
-                name="ha_onecontrol_can_quiet_start",
-            )
-            return
-
         # Official IDS-CAN adapters enable a LocalHost, wait for the bus to settle,
         # claim an unused source address with a NETWORK broadcast, then use that
         # claimed address for session and command traffic.  Without this, devices
@@ -1923,32 +1917,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._can_keepalive_task = self.hass.async_create_background_task(
             self._can_keepalive_loop(client), name="ha_onecontrol_can_keepalive"
         )
-
-    async def _can_start_runtime_traffic_after_quiet_period(
-        self, client: BleakClient, quiet_seconds: float
-    ) -> None:
-        """Delay post-auth CAN traffic for X180T experiment to test link stability."""
-        try:
-            await asyncio.sleep(quiet_seconds)
-            if not (
-                self._connected
-                and self._authenticated
-                and self._can_read_subscribed
-                and self._client is client
-            ):
-                return
-
-            _LOGGER.info(
-                "CAN BLE: X180T experiment — quiet mode complete; enabling LocalHost claim/discovery/keepalive"
-            )
-            await self._claim_can_local_host_address(client)
-            await self._flush_can_commands(client)
-            await self._send_can_device_discovery(client)
-            await self._can_keepalive_loop(client)
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("CAN BLE: quiet-start task ended due to error: %s", exc)
 
     def _on_can_read(
         self, characteristic: BleakGATTCharacteristic, data: bytearray
